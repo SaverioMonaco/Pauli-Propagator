@@ -22,6 +22,7 @@ from pennylane.tape import QuantumTape
 from .. import gates
 from ..pauli.sentence import PauliDict
 from .evolve import heisenberg
+from .pruning import Pruner
 from .utils import make_evaluator, remove_duplicate_observables, requires_propagation
 
 
@@ -159,7 +160,7 @@ class Propagator:
     # Public methods 
     # --------------- -
 
-    def propagate(self, opt: bool = False, debug: bool = False):
+    def propagate(self, debug: bool = False, pruners : List[Pruner] = []):
         """
         Propagate each observable backwards through the circuit (Heisenberg picture).
 
@@ -178,12 +179,11 @@ class Propagator:
 
         Parameters
         ----------
-        opt : bool, optional
-            If ``True``, applies pruning stategies.
-            Defaults to ``False``.
         debug : bool, optional
             If ``True``, print intermediate propagation steps for debugging.
             Defaults to ``False``.
+        pruners : List[Pruners]
+            List of pruners to apply during propagation
 
         Notes
         -----
@@ -200,7 +200,7 @@ class Propagator:
         for i, paulidict in enumerate(self.paulidicts):
             if debug:
                 print("Propagating", paulidict)
-            propagation = heisenberg(self.gates, paulidict, self.k1, self.k2, opt, debug)
+            propagation = heisenberg(self.gates, paulidict, self.k1, self.k2, debug, pruners)
             self.paulidicts[i], self.exprs[i] = propagation
 
         # Compile each symbolic expression into a pair of numeric callables:

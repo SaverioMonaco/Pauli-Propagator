@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 from pennylane import Hadamard as qmlH
 from pennylane import S as qmlS
+from pennylane import SX as qmlSX
 
 from ..pauli.op import PauliOp
 from ..pauli.sentence import CoeffTerms, PauliDict
@@ -162,3 +163,34 @@ class S(SimpleClifford):
             # Z commutes with S, no rule needed, handled by the base class fallthrough.
         }
         super().__init__(wires, qmlS, parameter, rule)
+
+
+class SX(SimpleClifford):
+    r"""
+    The single-qubit Square-Root X gate.
+
+    .. math::
+
+        \mathrm{SX} = \frac{1}{2}\begin{bmatrix} 1+i & 1-i \\ 1-i & 1+i \end{bmatrix}
+
+    Heisenberg evolution rules:
+
+    .. math::
+
+        X \mapsto X, \quad Y \mapsto -Z, \quad Z \mapsto Y
+
+    Parameters
+    ----------
+    wires : list[int]
+        Qubit on which the gate acts.
+    parameter : float, int, optional
+        Unused. Defaults to ``None``.
+    """
+
+    def __init__(self, wires: List[int], parameter: Optional[int] = None) -> None:
+        rule: EvolutionRule = {
+            "Y": ("Z", -1),
+            "Z": ("Y", +1),
+            # X commutes with SX (SX is a function of X), no rule needed.
+        }
+        super().__init__(wires, qmlSX, parameter, rule)

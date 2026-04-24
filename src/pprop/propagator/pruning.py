@@ -11,12 +11,12 @@ before they are evolved further and spawn even more branches.
 
 This submodule provides a small framework for such *pruning strategies*:
 
-* :class:`Pruner` — abstract base class defining the interface.
-* :class:`DeadQubitPruner` — removes words that carry an ``X`` or ``Y``
+* :class:`Pruner` abstract base class defining the interface.
+* :class:`DeadQubitPruner` removes words that carry an ``X`` or ``Y``
   operator on a qubit that will never be touched by any remaining gate and
   therefore can never be driven back to the :math:`Z/I` subspace required
   for a non-zero expectation value.
-* :class:`XYWeightPruner` — removes words whose XY-weight (number of qubits
+* :class:`XYWeightPruner` removes words whose XY-weight (number of qubits
   carrying ``X`` or ``Y``) exceeds the maximum reduction achievable by all
   remaining gates in the causal cone of that word.  Since each gate reduces
   XY-weight by at most 1, a word with too high a weight simply cannot reach
@@ -24,12 +24,12 @@ This submodule provides a small framework for such *pruning strategies*:
 
 All pruners share the same two-phase lifecycle:
 
-1. **Setup** (:meth:`Pruner.setup`) — called *once* before the evolution
+1. **Setup** (:meth:`Pruner.setup`) called *once* before the evolution
    loop with the full list of gates in reversed order.  This is where each
    pruner precomputes any auxiliary data structures it needs (e.g. suffix
    sets of active qubits).
 
-2. **Prune** (:meth:`Pruner.prune`) — called *once per gate step*, just
+2. **Prune** (:meth:`Pruner.prune`) called *once per gate step*, just
    before the gate is applied, with the current :class:`~pprop.pauli.sentence.PauliDict`
    and the index of the current step.  Dead entries are removed in-place.
 """
@@ -186,20 +186,89 @@ class DeadQubitPruner(Pruner):
 class XYWeightPruner(Pruner):
     """
     Prune Pauli words whose XY-weight exceeds the maximum reduction
-    achievable by all remaining gates combined.
+    achievable by the remaining gates in their causal cone.
 
     Correctness argument
     --------------------
     A Pauli word can only contribute to the expectation value if its
-    XY-weight reaches zero by the end of evolution. Each gate can reduce
-    the XY-weight by at most ``gate.max_xy_reduction`` (verified to be 1
-    for all single- and two-qubit gates in this gate set). Therefore if
-    the current XY-weight exceeds the total reduction budget remaining,
-    the word can never reach the :math:`ZI` subspace and is pruned.
+    XY-weight reaches zero by the end of evolution.  Each gate can reduce
+    the XY-weight by at most 1.  However, a gate can only contribute to
+    that reduction if it overlaps with the word's current XY support
+    (qubits carrying X or Y).  A gate that touches an XY qubit may also
+    spread the XY support to its other wires (conservative upper bound),
+    so subsequent gates touching those new qubits are also counted.
+
+    This causal-cone budget is a tight upper bound: if it is smaller than
+    the current XY-weight the word can never reach the :math:`ZI` subspace,
+    no matter how the gates are applied, and the word can be safely discarded.
     """
 
     def __init__(self) -> None:
-        self._budget: List[int] = []
+        self._reversed_gates: List[Gate] = []
+        self._gate_masks: List[int] = []
+
+    def setup(self, reversed_gates: List[Gate]) -> None:
+        """
+        Cache the reversed gate list and precompute wire bitmasks.
+
+        Parameters
+        ----------
+        reversed_gates : list[Gate]
+            Gates in Heisenberg traversal order (reversed circuit order).
+        """
+        self._reversed_gates = reversed_gates
+        self._gate_masks = [
+            sum(1 << w for w in gate.wires) for gate in reversed_gates
+        ]
+
+    def prune(self, paulidict: PauliDict, step: int) -> None:
+        """
+        Delete words whose XY-weight exceeds their causal-cone budget.
+
+        For each Pauli word the method walks the remaining gates
+        (``step`` to end, inclusive; the gate at ``step`` has not yet
+        been applied) and counts how many of them overlap with the word's
+        expanding XY support.  If that count is less than the XY-weight
+        the word is provably dead and removed.
+
+        Parameters
+        ----------
+        paulidict : PauliDict
+            Observable terms at the current step. Modified in-place.
+        step : int
+            Index of the gate about to be applied.
+        """
+        gate_masks = self._gate_masks
+        n = len(gate_masks)
+
+        dead_keys = []
+        for pw, _ in paulidict.items():
+            xy_weight = pw.x.bit_count()
+            if xy_weight == 0:
+                continue  # already Z/I, cannot be pruned
+
+            # Walk remaining gates and accumulate the causal-cone budget.
+            # xy_support expands conservatively: when a gate overlaps it,
+            # all of that gate's wires join the support (XY can spread).
+            xy_support = pw.x
+            budget = 0
+            for i in range(step, n):
+                gm = gate_masks[i]
+                if gm & xy_support:
+                    budget += 1
+                    xy_support |= gm      # conservative support expansion
+                    if budget >= xy_weight:
+                        break             # budget already sufficient
+
+            if budget < xy_weight:
+                dead_keys.append(pw)
+
+        dead = PauliDict({pw: [] for pw in dead_keys})
+        paulidict.remove_keys_from_dict(dead)
+
+class IQPPruner(Pruner):
+    def __init__(self) -> None:
+        pass
 
     def setup(self, reversed_gates: List[Gate]) -> None:
         """
@@ -210,22 +279,28 @@ class XYWeightPruner(Pruner):
         reversed_gates : list[Gate]
             Gates in Heisenberg traversal order (reversed circuit order).
         """
-        # Determine gate dependencies, this is used during propagation
-        # to determine when a word can be discarded when pruning is active
-        self.gate_dep = []
+        self.prune_step = []
+
+        direction = True
+        weight = 0
         for i, gate in enumerate(reversed_gates):
-            deps = set(gate.wires)
-            ops = []
-            for other_gate in reversed_gates[i+1:]:
-                if not deps.isdisjoint(other_gate.wires):
-                    deps |= set(other_gate.wires)
-                    ops.append(other_gate)
-            self.gate_dep.append(len(ops))
+            if gate.qml_gate.name in ['H', 'Hadamard', 'Barrier']:
+                continue
+            elif gate.qml_gate.name in ['CNOT']:
+                weight += 2*int(direction) - 1
+            elif gate.qml_gate.name in ["RZ"]:
+                direction = not direction
+            else:
+                raise ValueError(f"Not a valid IQP gate: {gate.qml_gate.name}")
+            
+            if gate.qml_gate.name in ['CNOT'] and weight == 0:
+                self.prune_step.append(i)
+
 
     def prune(self, paulidict: PauliDict, step: int) -> None:
         """
-        Delete words whose XY-weight exceeds the remaining budget.
-
+        Delete words with an X.
+    
         Parameters
         ----------
         paulidict : PauliDict
@@ -233,11 +308,11 @@ class XYWeightPruner(Pruner):
         step : int
             Index of the gate about to be applied.
         """    
-        budget = self.gate_dep[step]
+        # A word is dead if it has any X
+        if step in self.prune_step:
+            dead = PauliDict({
+                pw: [] for pw, _ in paulidict.items()
+                if not pw.zerobracket_X()
+            })
 
-        dead = PauliDict({
-            pw: [] for pw, _ in paulidict.items()
-            if pw.x.bit_count() > budget
-        })
-
-        paulidict.remove_keys_from_dict(dead)
+            paulidict.remove_keys_from_dict(dead)

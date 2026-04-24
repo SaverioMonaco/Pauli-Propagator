@@ -5,6 +5,7 @@ In submodules:
     - Single-qubit Clifford gates (clifford.py):
         - H: Hadamard
         - S: Phase gate
+        - SX: Square-Root X gate
 
     - Single-qubit non-clifford gates (nonclifford.py): 
         - T: T gate
@@ -19,13 +20,14 @@ In submodules:
 from .controlled import CNOT, CY, CZ
 from .controlledrotation import CRX, CRY, CRZ
 from .rotation import RX, RY, RZ
-from .simpleclifford import H, Hadamard, S
+from .simpleclifford import H, Hadamard, S, SX
 from .simplenonclifford import T
 
 __all__ = [
     "H",
     "Hadamard",
     "S",
+    "SX",
     "T",
     "RX",
     "RY",

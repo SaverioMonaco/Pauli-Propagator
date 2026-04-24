@@ -8,7 +8,7 @@ import numpy as np
 num_qubits = 3
 
 # Single qubit no param gates
-sqnp_gates = [qml.H, qml.S, qml.T]
+sqnp_gates = [qml.H, qml.S, qml.T, qml.SX]
 
 # Single qubit param gates
 sqp_gates = [qml.RX, qml.RY, qml.RZ]

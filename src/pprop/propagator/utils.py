@@ -189,24 +189,22 @@ def make_evaluator(
             \\prod_j \\sin^{s_{kj}}(\\theta_j)
             \\prod_j \\cos^{p_{kj}}(\\theta_j)
 
-    The gradient with respect to :math:`\\theta_j` follows from the chain rule
-    applied to both power factors:
+    The gradient with respect to :math:`\\theta_j` follows from the chain rule:
 
     .. math::
 
-        \\frac{\\partial t_k}{\\partial \\theta_j} = t_k \\left(
-            \\frac{s_{kj}\\,\\cos(\\theta_j)}{\\sin(\\theta_j)}
-            - \\frac{p_{kj}\\,\\sin(\\theta_j)}{\\cos(\\theta_j)}
-        \\right)
+        \\frac{\\partial t_k}{\\partial \\theta_j} =
+            c_k \\, s_{kj} \\sin^{s_{kj}-1}(\\theta_j) \\cos(\\theta_j)
+            \\prod_{l \\neq j} \\sin^{s_{kl}}(\\theta_l)
+            \\prod_l \\cos^{p_{kl}}(\\theta_l)
+            - c_k \\, p_{kj} \\cos^{p_{kj}-1}(\\theta_j) \\sin(\\theta_j)
+            \\prod_l \\sin^{s_{kl}}(\\theta_l)
+            \\prod_{l \\neq j} \\cos^{p_{kl}}(\\theta_l)
 
-    A small epsilon (``1e-30``) guards against division by zero when a
-    ``sin`` or ``cos`` factor is exactly zero.
+    Computed via prefix/suffix cumulative products to avoid any division.
     """
     # Pre-build dense arrays once; subsequent calls reuse them.
     coeffs, sin_counts, cos_counts = build_arrays(expr, num_params)
-
-    # Small constant to avoid 0/0 when a sin/cos factor vanishes.
-    eps = 1e-30
 
     def _eval(thetas: np.ndarray) -> float:
         """Evaluate the expectation value at ``thetas``."""
@@ -226,26 +224,45 @@ def make_evaluator(
         sins = np.sin(thetas)
         coss = np.cos(thetas)
 
-        sin_prods = np.prod(sins[None, :] ** sin_counts, axis=1)  # (n_terms,)
-        cos_prods = np.prod(coss[None, :] ** cos_counts, axis=1)  # (n_terms,)
-        term_vals = coeffs * sin_prods * cos_prods                 # (n_terms,)
+        sins_pow = sins[None, :] ** sin_counts  # (n_terms, num_params)
+        coss_pow = coss[None, :] ** cos_counts  # (n_terms, num_params)
 
-        # Guard against exact zeros to avoid NaN in the ratio term/sin or term/cos.
-        safe_sins = np.where(np.abs(sins) > eps, sins, eps)
-        safe_coss = np.where(np.abs(coss) > eps, coss, eps)
+        sin_prods = sins_pow.prod(axis=1)        # (n_terms,)
+        cos_prods = coss_pow.prod(axis=1)        # (n_terms,)
+        term_vals = coeffs * sin_prods * cos_prods
 
-        # Gradient from sin powers:  ∂/∂θⱼ [sin^s(θⱼ)] = s·cos(θⱼ)/sin(θⱼ) · term
-        # Where sin_counts is 0 the whole numerator is 0, so no special casing needed.
-        sin_grad = (
-            sin_counts * term_vals[:, None] * coss[None, :] / safe_sins[None, :]
+        n_terms = len(coeffs)
+
+        # Prefix/suffix cumulative products so we can form the product of all
+        # sin (or cos) factors *excluding* the j-th one without any division.
+        #   left[i, j]  = prod_{l < j} sins_pow[i, l]
+        #   right[i, j] = prod_{l > j} sins_pow[i, l]
+        left_sin  = np.cumprod(np.concatenate([np.ones((n_terms, 1)), sins_pow[:, :-1]], axis=1), axis=1)
+        right_sin = np.cumprod(np.concatenate([sins_pow[:, 1:], np.ones((n_terms, 1))], axis=1)[:, ::-1], axis=1)[:, ::-1]
+        excl_sin  = left_sin * right_sin  # (n_terms, num_params)
+
+        left_cos  = np.cumprod(np.concatenate([np.ones((n_terms, 1)), coss_pow[:, :-1]], axis=1), axis=1)
+        right_cos = np.cumprod(np.concatenate([coss_pow[:, 1:], np.ones((n_terms, 1))], axis=1)[:, ::-1], axis=1)[:, ::-1]
+        excl_cos  = left_cos * right_cos  # (n_terms, num_params)
+
+        # d/dtheta_j [sin(theta_j)^s] = s * sin(theta_j)^(s-1) * cos(theta_j)
+        # np.maximum avoids a negative exponent when s=0; np.where zeros that branch out.
+        d_sin = np.where(
+            sin_counts > 0,
+            sin_counts * sins[None, :] ** np.maximum(sin_counts - 1, 0) * coss[None, :],
+            0.0,
         )  # (n_terms, num_params)
 
-        # Gradient from cos powers:  ∂/∂θⱼ [cos^p(θⱼ)] = -p·sin(θⱼ)/cos(θⱼ) · term
-        cos_grad = (
-            -cos_counts * term_vals[:, None] * sins[None, :] / safe_coss[None, :]
+        # d/dtheta_j [cos(theta_j)^p] = -p * cos(theta_j)^(p-1) * sin(theta_j)
+        d_cos = np.where(
+            cos_counts > 0,
+            -cos_counts * coss[None, :] ** np.maximum(cos_counts - 1, 0) * sins[None, :],
+            0.0,
         )  # (n_terms, num_params)
 
-        # Sum contributions from all terms for each parameter.
+        sin_grad = coeffs[:, None] * d_sin * excl_sin * cos_prods[:, None]   # (n_terms, num_params)
+        cos_grad = coeffs[:, None] * sin_prods[:, None] * excl_cos * d_cos   # (n_terms, num_params)
+
         grad = (sin_grad + cos_grad).sum(axis=0)  # (num_params,)
 
         return float(term_vals.sum()), grad

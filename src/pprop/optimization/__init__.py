@@ -108,7 +108,8 @@ def adam(
 
     params    = params_init.copy().astype(float)
     opt_state = optimizer.init(params)
-    history: list[float] = []
+    loss_history: list[float] = []
+    params_history: list[float] = []
 
     # Build the gradient callable once outside the loop.
     # If the user supplies grad_L we use it directly; otherwise we wrap L
@@ -128,7 +129,8 @@ def adam(
         # Chain rule: ∂L/∂θ = (∂L/∂f) @ (∂f/∂θ)
         grad = dLdf @ f_grads                               # (num_params,)
 
-        history.append(loss)
+        loss_history.append(loss)
+        params_history.append(params.copy().tolist())
 
         # Apply one Adam step and update parameters.
         updates, opt_state = optimizer.update(grad, opt_state, params)
@@ -138,9 +140,10 @@ def adam(
             print(f"  step {step:5d}/{num_steps}  loss = {loss:.8f}")
 
     return {
-        "params":  params,
+        "params":  params.tolist(),
         "fun":     float(L(propagator(params))),
-        "history": history,
+        "loss_history": loss_history,
+        "params_history": params_history,
     }
 
 

@@ -203,6 +203,17 @@ class PauliOp:
         """
         return self.x == 0
 
+    def zerobracket_X(self) -> bool:
+        """
+        Return True if this Pauli word has nonzero expectation in |+><+|,
+        i.e. it is a pure X or I string (no Z or Y).
+
+        Returns
+        -------
+        bool
+        """
+        return self.z == 0
+
     def copy(self) -> PauliOp:
         """
         Return a shallow copy of this :class:`PauliOp`.

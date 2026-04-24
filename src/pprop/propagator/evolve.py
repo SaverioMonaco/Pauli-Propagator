@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 from ..gates.base import Gate
 from ..pauli.sentence import CoeffTerms, PauliDict
-from .pruning import DeadQubitPruner
+from .pruning import Pruner
 
 
 def to_expectation(paulidict: PauliDict) -> CoeffTerms:
@@ -51,8 +51,8 @@ def heisenberg(
     paulidict: PauliDict,
     k1: Optional[int],
     k2: Optional[int],
-    opt: bool = False,
     debug: bool = False,
+    pruners: List[Pruner] = [],
 ) -> Tuple[PauliDict, CoeffTerms]:
     r"""
     Evolve a :class:`~pprop.pauli.sentence.PauliDict` backwards through a list of gates
@@ -92,17 +92,10 @@ def heisenberg(
     """
     reversed_gates = gates[::-1]
 
-    if opt:
-        # pruners = [DeadQubitPruner(), XYWeightPruner()]
-        pruners = [DeadQubitPruner()]
-        for pruner in pruners:
-            pruner.setup(reversed_gates)
+    for pruner in pruners:
+        pruner.setup(reversed_gates)
         
     for i, gate in enumerate(reversed_gates):
-        if opt:
-            for pruner in pruners:
-                pruner.prune(paulidict, i)
-
         pauli_add    = PauliDict()  # Evolved replacement terms to add
         pauli_remove = PauliDict()  # Original terms to remove after evolution
 
@@ -128,5 +121,8 @@ def heisenberg(
             print("  REM:", pauli_remove)
             print("  ADD:", pauli_add)
             print("POST:", paulidict)
+
+        for pruner in pruners:
+            pruner.prune(paulidict, i)
 
     return paulidict, to_expectation(paulidict)
