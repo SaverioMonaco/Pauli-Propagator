@@ -4,9 +4,9 @@ Clifford gates, and the concrete gates :class:`H` and :class:`S`.
 """
 from typing import Dict, List, Optional, Tuple
 
+from pennylane import SX as qmlSX
 from pennylane import Hadamard as qmlH
 from pennylane import S as qmlS
-from pennylane import SX as qmlSX
 
 from ..pauli.op import PauliOp
 from ..pauli.sentence import CoeffTerms, PauliDict
@@ -54,7 +54,7 @@ class SimpleClifford(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this Clifford gate.
 
@@ -67,10 +67,6 @@ class SimpleClifford(Gate):
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair to evolve.
-        k1 : int or None
-            Pauli weight cutoff (unused, Clifford gates do not change weight).
-        k2 : int or None
-            Frequency cutoff (unused, Clifford gates do not change frequency).
 
         Returns
         -------
@@ -194,3 +190,36 @@ class SX(SimpleClifford):
             # X commutes with SX (SX is a function of X), no rule needed.
         }
         super().__init__(wires, qmlSX, parameter, rule)
+
+class SWAP(Gate):
+    """
+    The two-qubit SWAP gate.
+
+    Heisenberg evolution rule: exchanges the Pauli labels on the two wires.
+
+        P_i ⊗ Q_j  →  Q_i ⊗ P_j
+
+    No sign change ever occurs.
+    """
+
+    def __init__(self, wires: List[int], parameter=None) -> None:
+        from pennylane import SWAP as qmlSWAP
+        assert len(wires) == 2, "SWAP requires exactly two wires."
+        super().__init__(wires=wires, qml_gate=qmlSWAP, parameter=parameter)
+
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
+        op, coeff_terms = word
+        w0, w1 = self.wires
+
+        label0 = op[w0]  # Pauli on first wire
+        label1 = op[w1]  # Pauli on second wire
+
+        # If both labels are identical, the word is unchanged (trivially).
+        if label0 == label1:
+            return PauliDict({op: coeff_terms})
+
+        new_op = op.copy()
+        new_op.set(w0, label1)  # put wire-1's label on wire 0
+        new_op.set(w1, label0)  # put wire-0's label on wire 1
+
+        return PauliDict({new_op: list(coeff_terms)})

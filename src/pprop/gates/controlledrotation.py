@@ -63,7 +63,6 @@ from pennylane import CRZ as qmlCRZ
 from ..pauli.op import PauliOp
 from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
-from .utils import get_frequency
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -127,7 +126,7 @@ class ControlledRotationGate(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this controlled rotation gate.
 
@@ -137,18 +136,10 @@ class ControlledRotationGate(Gate):
         ``self.parameter`` and then appended to every existing term's
         index lists.
 
-        The weight cutoff ``k1`` is checked on the output Pauli word.
-        The frequency cutoff ``k2`` is checked on each existing term before
-        appending new trig factors.
-
         Parameters
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair to evolve.
-        k1 : int or None
-            Pauli weight cutoff.
-        k2 : int or None
-            Frequency cutoff.
 
         Returns
         -------
@@ -173,10 +164,6 @@ class ControlledRotationGate(Gate):
             new_op.set(wire0, output_label[0])
             new_op.set(wire1, output_label[1])
 
-            # Discard if evolved word exceeds Pauli weight cutoff.
-            if k1 is not None and new_op.weight() > k1:
-                continue
-
             # Substitute the placeholder -1 with the actual parameter index.
             sin_ext = [p if i == _P else i for i in m_sin]
             cos_ext = [p if i == _P else i for i in m_cos]
@@ -185,16 +172,11 @@ class ControlledRotationGate(Gate):
             new_terms: CoeffTerms = []
             for c, s, cc in coeff_terms:
                 if isinstance(self.parameter, (integer, intp)):
-                    # Discard if adding new trig factors would exceed frequency cutoff.
-                    if k2 is not None and get_frequency((c, s, cc)) + len(sin_ext) + len(cos_ext) > k2:
-                        continue
-
                     new_terms.append((
                         m_coeff * c,
                         list(s) + sin_ext,
                         list(cc) + cos_ext,
                     ))
-
                 else:
                     new_terms.append((
                         m_coeff * c * prod(sin(sin_ext)) * prod(cos(cos_ext)),

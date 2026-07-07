@@ -42,6 +42,7 @@ env.bak/
 venv.bak/
 flo/
 __pypackages__/
+.python-version
 
 # ── Testing & coverage ────────────────────────────────────────────────────────
 htmlcov/
@@ -141,3 +142,4 @@ test.ipynb
 test/
 slurm/
 mnist_data/
+scripts/

@@ -1,11 +1,12 @@
 """This module handles the core evolution of Pauli words through a list of gates
 via the Heisenberg picture.
 """
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from ..gates.base import Gate
 from ..pauli.sentence import CoeffTerms, PauliDict
 from .pruning import Pruner
+from .truncation import Truncation
 
 
 def to_expectation(paulidict: PauliDict) -> CoeffTerms:
@@ -47,12 +48,11 @@ def to_expectation(paulidict: PauliDict) -> CoeffTerms:
 
 
 def heisenberg(
-    gates : List[Gate],
+    gates: List[Gate],
     paulidict: PauliDict,
-    k1: Optional[int],
-    k2: Optional[int],
     debug: bool = False,
     pruners: List[Pruner] = [],
+    truncations: List[Truncation] = [],
 ) -> Tuple[PauliDict, CoeffTerms]:
     r"""
     Evolve a :class:`~pprop.pauli.sentence.PauliDict` backwards through a list of gates
@@ -70,17 +70,13 @@ def heisenberg(
         in reverse).
     paulidict : PauliDict
         Initial observable represented as a mapping of ``PauliOp -> CoeffTerms``.
-    k1 : int or None
-        Pauli weight cutoff. Evolved terms whose Pauli weight exceeds ``k1``
-        are discarded. ``None`` disables this truncation.
-    k2 : int or None
-        Frequency cutoff. Evolved terms whose total trigonometric frequency
-        exceeds ``k2`` are discarded. ``None`` disables this truncation.
-    opt : bool, optional
-        If ``True``, use optimized pruning strategy. Defaults to ``False``.
     debug : bool, optional
         If ``True``, print the gate, pre-evolution, and post-evolution state at
         each step. Defaults to ``False``.
+    pruners : list[Pruner], optional
+        Exact pruning strategies applied before each gate step.
+    truncations : list[Truncation], optional
+        Approximate truncation strategies applied after each gate step.
 
     Returns
     -------
@@ -91,17 +87,24 @@ def heisenberg(
         value :math:`\langle 0 | U^\dagger O U | 0 \rangle`.
     """
     reversed_gates = gates[::-1]
+    history = []
 
     for pruner in pruners:
         pruner.setup(reversed_gates)
-        
+
+    for truncation in truncations:
+        truncation.setup(reversed_gates)
+
     for i, gate in enumerate(reversed_gates):
         pauli_add    = PauliDict()  # Evolved replacement terms to add
         pauli_remove = PauliDict()  # Original terms to remove after evolution
 
+        for pruner in pruners:
+            pruner.prune(paulidict, i)
+
         for pauliword, coeffterms in paulidict.items():
             # Evolve this (pauliword, coeffterms) pair through the gate.
-            evolved: PauliDict = gate.evolve((pauliword, coeffterms), k1, k2)
+            evolved: PauliDict = gate.evolve((pauliword, coeffterms))
 
             pauli_add    += evolved
             # Only the key (PauliOp) matters here; the coefficient is irrelevant
@@ -121,8 +124,9 @@ def heisenberg(
             print("  REM:", pauli_remove)
             print("  ADD:", pauli_add)
             print("POST:", paulidict)
+            history.append(paulidict.copy())
 
-        for pruner in pruners:
-            pruner.prune(paulidict, i)
+        for truncation in truncations:
+            truncation.truncate(paulidict, i)
 
-    return paulidict, to_expectation(paulidict)
+    return paulidict, to_expectation(paulidict), history

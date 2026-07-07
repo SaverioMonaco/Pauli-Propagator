@@ -59,7 +59,7 @@ class ControlledGate(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this controlled gate.
 
@@ -68,24 +68,15 @@ class ControlledGate(Gate):
         returned unchanged. Otherwise both qubits are updated and all scalar
         coefficients are multiplied by the sign.
 
-        After applying the rule, the evolved word is checked against the Pauli
-        weight cutoff ``k1``. If its weight exceeds ``k1`` it is discarded
-        entirely (returning an empty :class:`~pprop.pauli.sentence.PauliDict`).
-
         Parameters
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair to evolve.
-        k1 : int or None
-            Pauli weight cutoff. Evolved words with weight exceeding ``k1``
-            are discarded. ``None`` disables truncation.
-        k2 : int or None
-            Frequency cutoff (unused, controlled gates do not change frequency).
 
         Returns
         -------
         PauliDict
-            Empty if truncated by ``k1``; one entry otherwise.
+            One entry (the evolved word).
         """
         op, coeff_terms = word
         wire0, wire1 = self.wires
@@ -102,10 +93,6 @@ class ControlledGate(Gate):
         new_op = op.copy()
         new_op.set(wire0, out0)
         new_op.set(wire1, out1)
-
-        # Discard if the evolved word exceeds the Pauli weight cutoff.
-        if k1 is not None and new_op.weight() > k1:
-            return PauliDict()
 
         # Scale coefficients by the sign; avoid unnecessary list comprehension for +1.
         if sign == 1:

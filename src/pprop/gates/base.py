@@ -112,7 +112,7 @@ class Gate(ABC):
             )
 
     @abstractmethod
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this gate.
 
@@ -121,26 +121,16 @@ class Gate(ABC):
         returned as a :class:`~pprop.pauli.sentence.PauliDict` mapping each
         output Pauli word to its updated :data:`~pprop.pauli.sentence.CoeffTerms`.
 
-        Subclasses may return an empty :class:`~pprop.pauli.sentence.PauliDict`
-        to signal that the evolved word has been truncated by a cutoff.
-
         Parameters
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair representing the Pauli word to evolve
             and its current symbolic coefficient.
-        k1 : int or None
-            Pauli weight cutoff. Evolved words whose weight exceeds ``k1``
-            are discarded. ``None`` disables weight truncation.
-        k2 : int or None
-            Frequency cutoff. Evolved terms whose trigonometric frequency
-            exceeds ``k2`` are discarded. ``None`` disables frequency truncation.
 
         Returns
         -------
         PauliDict
-            The evolved Pauli word(s) with updated coefficients. May be empty
-            if the result was truncated by ``k1`` or ``k2``.
+            The evolved Pauli word(s) with updated coefficients.
         """
 
     def __repr__(self) -> str:

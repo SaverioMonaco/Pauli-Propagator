@@ -26,11 +26,13 @@ Usage
 -----
     python train.py --side 8 --num_obs 20 --lr 0.05 --num_epochs 100 \\
                     --num_steps 20 --k1 6 --k2 20 --seed 0
+    python train.py --digits 0 1 --side 8  # train on 0s and 1s only
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import gzip
 import json
 import struct
@@ -251,6 +253,7 @@ def train(
     global_step = 0
 
     for r in range(n_rounds):
+        print(f"{r}/{n_rounds}...")
         batch_pool = sample_observables_binomial(num_qubits, sigma, n_obs, rng)
         batch_mu   = compute_data_moments(X_train, batch_pool)
         batch_obs  = [ob      for _, ob, _     in batch_pool]
@@ -258,7 +261,7 @@ def train(
         weights   /= weights.sum()
 
         prop = Propagator(circuit_maker(num_qubits, batch_obs), k1=k1, k2=k2)
-        prop.propagate(pruners=[XYWeightPruner(), DeadQubitPruner()])
+        prop.propagate(pruners=[XYWeightPruner(), DeadQubitPruner()], num_jobs=args.num_jobs)
 
         mu = batch_mu
         w  = weights
@@ -316,7 +319,7 @@ def validate(
         weights   /= weights.sum()
 
         prop = Propagator(circuit_maker(num_qubits, batch_obs), k1=k1, k2=k2)
-        prop.propagate(pruners=[XYWeightPruner(), DeadQubitPruner()])
+        prop.propagate(pruners=[XYWeightPruner(), DeadQubitPruner()], num_jobs=args.num_jobs)
 
         residuals = prop(params) - batch_mu
         mmd_values.append(float(np.dot(weights, residuals ** 2)))
@@ -340,7 +343,7 @@ if __name__ == '__main__':
                         help='Number of training rounds.')
     parser.add_argument('--lr',            type=float, default=0.1,
                         help='Adam learning rate.')
-    parser.add_argument('--num_steps',     type=int,   default=10000,
+    parser.add_argument('--num_steps',     type=int,   default=5000,
                         help='Adam steps per round.')
     parser.add_argument('--k1',            type=int,   default=6,
                         help='Propagator k1 truncation parameter.')
@@ -354,19 +357,36 @@ if __name__ == '__main__':
                         help='Directory with (or for) MNIST IDX files.')
     parser.add_argument('--max_train',     type=int,   default=5000,
                         help='Maximum training samples.')
+    parser.add_argument('--num_jobs',     type=int,   default=8,
+                        help='Number of jobs.')
+    parser.add_argument('--digits',        type=int,   nargs='+',
+                        default=list(range(10)),
+                        metavar='D',
+                        help='Digit classes to include (default: 0-9).')
     args = parser.parse_args()
+    args.num_jobs = os.cpu_count()
+    print(f"CPU Count: {args.num_jobs}")
+
+    # Validate digit values
+    invalid = [d for d in args.digits if not (0 <= d <= 9)]
+    if invalid:
+        parser.error(f"Invalid digit(s): {invalid}. Must be in 0-9.")
 
     num_qubits  = args.side * args.side
+    digits_tag  = "".join(str(d) for d in sorted(args.digits))
     folder_name = (
         f"{args.side}_{args.num_obs}_{args.num_epochs}"
         f"_{args.lr}_{args.num_steps}_{args.k1}_{args.k2}"
+        f"_d{digits_tag}"
     )
     out_path = Path(args.path) / folder_name
     out_path.mkdir(parents=True, exist_ok=True)
 
+    print(f"Training on digits: {sorted(args.digits)}")
     X_train = get_mnist(
         args.side, args.side,
         data_dir    = args.data_dir,
+        digits      = args.digits,
         split       = "train",
         max_samples = args.max_train,
     )
@@ -395,6 +415,7 @@ if __name__ == '__main__':
     X_test = get_mnist(
         args.side, args.side,
         data_dir    = args.data_dir,
+        digits      = args.digits,
         split       = "test",
         max_samples = 5000,
         seed        = args.seed,

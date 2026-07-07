@@ -56,7 +56,7 @@ class SimpleNonClifford(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this non-Clifford gate.
 
@@ -70,10 +70,6 @@ class SimpleNonClifford(Gate):
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair to evolve.
-        k1 : int or None
-            Pauli weight cutoff (unused, non-Clifford gates do not change weight).
-        k2 : int or None
-            Frequency cutoff (unused, non-Clifford gates do not change frequency).
 
         Returns
         -------

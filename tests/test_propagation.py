@@ -60,11 +60,16 @@ def test_propagation():
 
         for _ in range(5):
             random_params = qml.numpy.random.uniform(-np.pi, np.pi, propagator.num_params)
-            prop_output = propagator(random_params)
+            prop_output, prop_grad = propagator.eval_and_grad(random_params)
             qml_output = qnode(random_params)
+            qml_grad = qml.gradients.param_shift(qnode)(random_params)
 
             assert np.allclose(prop_output, qml_output, atol=1e-6), (
-                f"Mismatch:\nprop:  {prop_output}\nqml:   {qml_output}"
+                f"Mismatch EVAL:\nprop:  {prop_output}\nqml:   {qml_output}"
+            )
+
+            assert np.allclose(prop_grad, qml_grad, atol=1e-6), (
+                f"Mismatch GRAD:\nprop:  {prop_grad}\nqml:   {qml_grad}"
             )
 # %%
 test_propagation()

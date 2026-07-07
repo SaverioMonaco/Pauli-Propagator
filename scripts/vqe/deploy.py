@@ -76,7 +76,8 @@ def main() -> None:
     side           = int(np.sqrt(num_qubits))
 
     n       = len(params_history)
-    indices = np.linspace(0, n - 1, 10, dtype=int)
+    indices = np.linspace(0, n - 1, 10, dtype=int)[5:]
+    print(indices)
     reduced_params_history = [params_history[i] for i in indices]
 
     print("deploy.py")

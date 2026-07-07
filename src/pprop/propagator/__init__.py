@@ -13,6 +13,9 @@ the expectation value of an observable.
 ...     return [qml.expval(qml.PauliZ(0))]
 >>> prop = Propagator(ansatz, k1 = None, k2 = None)
 """
+import os
+from functools import partial
+from multiprocessing import Pool
 from typing import Callable, List, Optional, Tuple
 
 from numpy import arange, array, ndarray, stack
@@ -23,8 +26,16 @@ from .. import gates
 from ..pauli.sentence import PauliDict
 from .evolve import heisenberg
 from .pruning import Pruner
+from .truncation import FrequencyTruncation, Truncation, WeightTruncation
 from .utils import make_evaluator, remove_duplicate_observables, requires_propagation
 
+
+def _propagate_one(paulidict, gates, debug, pruners, truncations):
+    """Module-level wrapper around heisenberg() so it can be pickled and
+    sent to worker processes. multiprocessing can't pickle bound methods
+    or closures reliably, so this has to live at module scope.
+    """
+    return heisenberg(gates, paulidict, debug, pruners, truncations)
 
 class Propagator:
     """
@@ -159,53 +170,72 @@ class Propagator:
     # --------------- -
     # Public methods 
     # --------------- -
-
-    def propagate(self, debug: bool = False, pruners : List[Pruner] = []):
+    def propagate(
+        self,
+        debug: bool = False,
+        pruners: List[Pruner] = [],
+        truncations: List[Truncation] = [],
+        num_jobs: int = 1,
+    ):
         """
         Propagate each observable backwards through the circuit (Heisenberg picture).
 
-        For every :class:`~pprop.pauli.sentence.PauliDict` in :attr:`paulidicts`,
-        this method calls :func:`~.evolve.heisenberg` to evolve the observable
-        through all gates in reverse, collecting the symbolic trigonometric
-        expression that represents the expectation value as a function of the
-        circuit parameters.
+        ... (existing docstring text unchanged) ...
 
-        The resulting expressions are compiled into fast numeric callables stored
-        in :attr:`_eval_list` and :attr:`_eval_and_grad_list`, enabling efficient
-        evaluation and gradient computation via :meth:`__call__` and
-        :meth:`eval_and_grad`.
-
-        Can only be called once; subsequent calls are silently skipped.
-
-        Parameters
-        ----------
-        debug : bool, optional
-            If ``True``, print intermediate propagation steps for debugging.
-            Defaults to ``False``.
-        pruners : List[Pruners]
-            List of pruners to apply during propagation
-
-        Notes
-        -----
-        After this method returns, :attr:`_propagated` is set to ``True``,
-        unlocking the :func:`~.utils.requires_propagation`-decorated methods.
+        num_jobs : int, optional
+            Number of worker processes used to propagate observables in
+            parallel. Each entry in :attr:`paulidicts` is evolved
+            independently, so this loop parallelizes cleanly across
+            processes. Defaults to ``1`` (sequential — identical behaviour
+            and ordering to before). Requires :attr:`gates`, ``pruners``,
+            and ``truncations`` to be picklable. When ``num_jobs > 1`` and
+            ``debug=True``, printed output from different observables will
+            be interleaved/out of order since it comes from separate
+            processes.
         """
-        
         if self._propagated:
             print("Already propagated")
             return
-        
-        # Propagate each observable and store the resulting symbolic expression.
-        self.exprs = [None]*len(self.paulidicts)
-        for i, paulidict in enumerate(self.paulidicts):
-            if debug:
-                print("Propagating", paulidict)
-            propagation = heisenberg(self.gates, paulidict, self.k1, self.k2, debug, pruners)
-            self.paulidicts[i], self.exprs[i] = propagation
 
-        # Compile each symbolic expression into a pair of numeric callables:
-        #   fg[0] : params -> float          (expectation value only)
-        #   fg[1] : params -> (float, array) (expectation value + gradient)
+        builtin_truncations: List[Truncation] = []
+        if self.k1 is not None:
+            builtin_truncations.append(WeightTruncation(self.k1))
+        if self.k2 is not None:
+            builtin_truncations.append(FrequencyTruncation(self.k2))
+        all_truncations = builtin_truncations + list(truncations)
+
+        self.exprs = [None] * len(self.paulidicts)
+        self.history = [None] * len(self.paulidicts)
+
+        if num_jobs == -1:
+            num_jobs = os.cpu_count()
+        elif num_jobs < 1:
+            raise ValueError(f"num_jobs must be -1 or a positive integer, got {num_jobs}")
+
+        if num_jobs == 1:
+            for i, paulidict in enumerate(self.paulidicts):
+                if debug:
+                    print("Propagating", paulidict)
+                propagationdicts, propagationexprs, history = heisenberg(
+                    self.gates, paulidict, debug, pruners, all_truncations
+                )
+                self.paulidicts[i], self.exprs[i] = propagationdicts, propagationexprs
+                self.history[i] = history
+        else:
+            worker = partial(
+                _propagate_one,
+                gates=self.gates,
+                debug=debug,
+                pruners=pruners,
+                truncations=all_truncations,
+            )
+            with Pool(num_jobs) as pool:
+                results = pool.map(worker, self.paulidicts)
+
+            for i, (propagationdicts, propagationexprs, history) in enumerate(results):
+                self.paulidicts[i], self.exprs[i] = propagationdicts, propagationexprs
+                self.history[i] = history
+
         self._eval_list: List[Callable] = []
         self._eval_and_grad_list: List[Callable] = []
 
@@ -214,7 +244,6 @@ class Propagator:
             self._eval_list.append(fg[0])
             self._eval_and_grad_list.append(fg[1])
 
-        # Mark propagation as complete, enabling __call__ and eval_and_grad.
         self._propagated = True
         
     def show(self) -> None:

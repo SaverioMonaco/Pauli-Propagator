@@ -39,8 +39,8 @@ def main() -> None:
         help="Number of measurement shots (default: 64).",
     )
     parser.add_argument(
-        "--backend", type=str, default="ibm_torino",
-        help="IBM backend name (default: ibm_torino).",
+        "--backend", type=str, default="ibm_berlin",
+        help="IBM backend name (default: ibm_berlin).",
     )
     parser.add_argument(
         "--channel", type=str, default="ibm_cloud",

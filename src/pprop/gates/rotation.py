@@ -13,7 +13,6 @@ from pennylane import RZ as qmlRZ
 from ..pauli.op import PauliOp
 from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
-from .utils import get_frequency
 
 # Rule type: maps a single-qubit Pauli label to (output_label, sign).
 # Absent labels commute with the rotation axis and pass through unchanged.
@@ -72,7 +71,7 @@ class RotationGate(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms], k1, k2) -> PauliDict:
+    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
         """
         Heisenberg-evolve a Pauli word through this rotation gate.
 
@@ -87,25 +86,16 @@ class RotationGate(Gate):
         to the ``cos_idx`` (cosine branch, same Pauli) or ``sin_idx`` (sine
         branch, new Pauli) of every existing :data:`CoeffTerm`.
 
-        If the frequency cutoff ``k2`` is set and any term already has
-        frequency :math:`\\geq k2`, the word is discarded entirely (returning
-        an empty :class:`~pprop.pauli.sentence.PauliDict`) since appending one
-        more trig factor would exceed the cutoff.
-
         Parameters
         ----------
         word : tuple[PauliOp, CoeffTerms]
             ``(pauliop, coeff_terms)`` pair to evolve.
-        k1 : int or None
-            Pauli weight cutoff (unused, rotation gates do not change weight).
-        k2 : int or None
-            Frequency cutoff. Terms at or above this frequency are discarded.
 
         Returns
         -------
         PauliDict
-            Empty if truncated by ``k2``; one entry if the word commutes with
-            the gate; two entries (cos and sin branches) otherwise.
+            One entry if the word commutes with the gate; two entries
+            (cos and sin branches) otherwise.
         """
         op, coeff_terms = word
         wire  = self.wires[0]
@@ -122,10 +112,6 @@ class RotationGate(Gate):
         new_op.set(wire, output_label)
 
         if isinstance(self.parameter, (integer, intp)):
-            # Discard if adding one more trig factor would exceed the frequency cutoff.
-            if k2 is not None and get_frequency(coeff_terms[0]) >= k2:
-                return PauliDict()
-
             # Cosine branch: original Pauli survives, each term gains a cos(θ) factor.
             cos_terms: CoeffTerms = [
                 (c, list(s), list(cc) + [self.parameter])

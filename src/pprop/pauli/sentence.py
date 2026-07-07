@@ -272,3 +272,16 @@ class PauliDict:
             # lists are empty, this is a valid CoeffTerm with frequency 0.
             result.add_term(PauliOp.from_qml(w), (float(c), [], []))
         return result
+
+    def copy(self) -> PauliDict:
+        """
+        Return a shallow copy of this PauliDict.
+
+        Each key's CoeffTerms list is copied, but the tuples inside
+        (which are immutable) are not duplicated.
+
+        Returns
+        -------
+        PauliDict
+        """
+        return PauliDict({k: list(v) for k, v in self._dict.items()})

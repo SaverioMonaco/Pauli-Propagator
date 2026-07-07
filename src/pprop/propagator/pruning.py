@@ -21,7 +21,6 @@ This submodule provides a small framework for such *pruning strategies*:
   remaining gates in the causal cone of that word.  Since each gate reduces
   XY-weight by at most 1, a word with too high a weight simply cannot reach
   XY-weight 0 before the circuit ends.
-
 All pruners share the same two-phase lifecycle:
 
 1. **Setup** (:meth:`Pruner.setup`) called *once* before the evolution
@@ -266,53 +265,3 @@ class XYWeightPruner(Pruner):
         dead = PauliDict({pw: [] for pw in dead_keys})
         paulidict.remove_keys_from_dict(dead)
 
-class IQPPruner(Pruner):
-    def __init__(self) -> None:
-        pass
-
-    def setup(self, reversed_gates: List[Gate]) -> None:
-        """
-        Build the suffix-sum budget table.
-
-        Parameters
-        ----------
-        reversed_gates : list[Gate]
-            Gates in Heisenberg traversal order (reversed circuit order).
-        """
-        self.prune_step = []
-
-        direction = True
-        weight = 0
-        for i, gate in enumerate(reversed_gates):
-            if gate.qml_gate.name in ['H', 'Hadamard', 'Barrier']:
-                continue
-            elif gate.qml_gate.name in ['CNOT']:
-                weight += 2*int(direction) - 1
-            elif gate.qml_gate.name in ["RZ"]:
-                direction = not direction
-            else:
-                raise ValueError(f"Not a valid IQP gate: {gate.qml_gate.name}")
-            
-            if gate.qml_gate.name in ['CNOT'] and weight == 0:
-                self.prune_step.append(i)
-
-
-    def prune(self, paulidict: PauliDict, step: int) -> None:
-        """
-        Delete words with an X.
-    
-        Parameters
-        ----------
-        paulidict : PauliDict
-            Observable terms at the current step. Modified in-place.
-        step : int
-            Index of the gate about to be applied.
-        """    
-        # A word is dead if it has any X
-        if step in self.prune_step:
-            dead = PauliDict({
-                pw: [] for pw, _ in paulidict.items()
-                if not pw.zerobracket_X()
-            })
-
-            paulidict.remove_keys_from_dict(dead)
