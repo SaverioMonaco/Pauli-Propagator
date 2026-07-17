@@ -96,6 +96,19 @@ def heisenberg(
         truncation.setup(reversed_gates)
 
     for i, gate in enumerate(reversed_gates):
+        # A gate whose wires don't touch any qubit currently carrying a
+        # non-identity operator in `paulidict` acts as the identity on every
+        # term present - skip pruning/truncation/evolution for it entirely.
+        # This is exact, not approximate: pruners/truncations only ever base
+        # their decisions on the *current* paulidict and the *remaining*
+        # gates, both of which are unaffected by a gate that overlaps
+        # nothing currently tracked, so deferring their next call to the
+        # next relevant gate is indistinguishable from calling them here.
+        # Skipped only when `debug=False`, so `debug=True` keeps its full
+        # per-gate trace/history unchanged.
+        if not debug and not (gate.wire_mask & paulidict.active_mask):
+            continue
+
         pauli_add    = PauliDict()  # Evolved replacement terms to add
         pauli_remove = PauliDict()  # Original terms to remove after evolution
 

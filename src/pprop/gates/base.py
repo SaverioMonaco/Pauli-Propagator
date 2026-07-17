@@ -75,6 +75,10 @@ class Gate(ABC):
         )
         self.wires = wires
         self.parameter = parameter
+        # Bitmask of `wires`, cached once so heisenberg() can cheaply test a
+        # gate for overlap against a PauliDict's active-qubit mask without
+        # recomputing `sum(1 << w for w in wires)` on every propagation step.
+        self.wire_mask = sum(1 << w for w in wires)
 
         # ------------------------------------------------------------------ #
         # Validation                                                           #

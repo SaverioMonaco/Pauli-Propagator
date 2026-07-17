@@ -60,10 +60,61 @@ class PauliDict:
     >>> d.add_term(key, (0.5, [], [0, 1]))  # 0.5 * cos(θ₀) * cos(θ₁)
     """
 
-    __slots__ = ("_dict",)
+    __slots__ = ("_dict", "_qubit_refcount", "_active_mask")
 
     def __init__(self, data: dict | None = None) -> None:
         self._dict: dict[PauliOp, CoeffTerms] = dict(data) if data is not None else {}
+        # Per-qubit reference counts and their OR-aggregate (`_active_mask`):
+        # how many keys currently touch each qubit, so `active_mask` - "which
+        # qubits does *something* in this dict act non-trivially on" - stays
+        # an O(1) read instead of an O(len(self)) scan over every key. Used by
+        # heisenberg() to skip gates whose wires can't affect anything
+        # currently tracked. Incremented/decremented only on key
+        # insertion/removal (not on updates to an existing key's CoeffTerms),
+        # so it costs O(popcount(key mask)) - not O(len(self)) - per mutation.
+        self._qubit_refcount: dict[int, int] = {}
+        self._active_mask = 0
+        for key in self._dict:
+            self._add_key_refs(key)
+
+    def _add_key_refs(self, key: PauliOp) -> None:
+        """Register a newly-inserted key's qubits in the refcount/active-mask."""
+        mask = key.x | key.z
+        m = mask
+        while m:
+            low = m & (-m)
+            q = low.bit_length() - 1
+            self._qubit_refcount[q] = self._qubit_refcount.get(q, 0) + 1
+            m &= m - 1
+        self._active_mask |= mask
+
+    def _remove_key_refs(self, key: PauliOp) -> None:
+        """Unregister a removed key's qubits from the refcount/active-mask."""
+        mask = key.x | key.z
+        m = mask
+        while m:
+            low = m & (-m)
+            q = low.bit_length() - 1
+            count = self._qubit_refcount.get(q, 0) - 1
+            if count <= 0:
+                self._qubit_refcount.pop(q, None)
+                self._active_mask &= ~low
+            else:
+                self._qubit_refcount[q] = count
+            m &= m - 1
+
+    @property
+    def active_mask(self) -> int:
+        """
+        Bitmask OR of ``(key.x | key.z)`` over every key currently in this dict.
+
+        Bit ``q`` is set iff at least one tracked Pauli word acts
+        non-trivially (X, Y, or Z) on qubit ``q``. A gate whose wires don't
+        intersect this mask would act as the identity on every term
+        currently in the dict - see ``heisenberg()`` in
+        :mod:`~pprop.propagator.evolve`.
+        """
+        return self._active_mask
 
     def __setitem__(self, key: PauliOp, value: CoeffTerms) -> None:
         """
@@ -74,6 +125,8 @@ class PauliDict:
         key : PauliOp
         value : CoeffTerms
         """
+        if key not in self._dict:
+            self._add_key_refs(key)
         self._dict[key] = value
 
     def __getitem__(self, key: PauliOp) -> CoeffTerms:
@@ -160,6 +213,7 @@ class PauliDict:
         if key in self._dict:
             self._dict[key].append(term)
         else:
+            self._add_key_refs(key)
             self._dict[key] = [term]
 
     def add_terms(self, key: PauliOp, terms: CoeffTerms) -> None:
@@ -176,6 +230,7 @@ class PauliDict:
         if key in self._dict:
             self._dict[key].extend(terms)
         else:
+            self._add_key_refs(key)
             self._dict[key] = list(terms)
 
     def add_terms_from_dict(self, other: PauliDict) -> None:
@@ -194,6 +249,7 @@ class PauliDict:
             if k in self._dict:
                 self._dict[k].extend(terms)
             else:
+                self._add_key_refs(k)
                 self._dict[k] = list(terms)
 
     def remove_keys_from_dict(self, other: PauliDict) -> None:
@@ -209,7 +265,13 @@ class PauliDict:
             Keys to remove.
         """
         other_keys = other._dict.keys()
-        self._dict = {k: v for k, v in self._dict.items() if k not in other_keys}
+        new_dict = {}
+        for k, v in self._dict.items():
+            if k in other_keys:
+                self._remove_key_refs(k)
+            else:
+                new_dict[k] = v
+        self._dict = new_dict
 
     def __iadd__(self, other: PauliDict) -> PauliDict:
         """

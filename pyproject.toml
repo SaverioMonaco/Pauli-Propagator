@@ -16,6 +16,7 @@ dependencies = [
     "jax==0.5.0",
     "jaxlib==0.5.0",
     "optax==0.2.4",
+    "wandb>=0.19",
 ]
 
 [tool.mypy]

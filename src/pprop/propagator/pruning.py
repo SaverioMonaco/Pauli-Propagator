@@ -216,9 +216,7 @@ class XYWeightPruner(Pruner):
             Gates in Heisenberg traversal order (reversed circuit order).
         """
         self._reversed_gates = reversed_gates
-        self._gate_masks = [
-            sum(1 << w for w in gate.wires) for gate in reversed_gates
-        ]
+        self._gate_masks = [gate.wire_mask for gate in reversed_gates]
 
     def prune(self, paulidict: PauliDict, step: int) -> None:
         """
