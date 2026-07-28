@@ -83,8 +83,7 @@ prop_output = prop(random_params)
 ## Installation
 
 Propagation runs in a Rust extension, so installation is two steps: the
-Python package, then building that extension (needs a Rust toolchain, e.g.
-via [rustup](https://rustup.rs/)):
+Python package, then building that extension:
 
 ```bash
 pip install -e .
@@ -101,11 +100,7 @@ virtual environment. Re-run it after pulling changes to `native/pprop_rs`.
 
 For detailed examples, please refer to the `notebooks` directory, which
 contains Jupyter notebooks that demonstrate various use cases and tests of
-the propagator. Running them requires the `notebooks` extra:
-
-```bash
-pip install -e ".[notebooks]"
-```
+the propagator.
 
 ## Citation
 If you use this software in your research or publications, **please cite** the following: 
