@@ -1,6 +1,12 @@
 """
 This submodule defines :class:`SimpleClifford`, the base class for single-qubit
 Clifford gates, and the concrete gates :class:`H` and :class:`S`.
+
+The ``rule`` tables below (and :class:`SWAP`'s evolution logic) are the
+human-readable reference for these gates' Heisenberg evolution; the Rust
+extension ``pprop_rs`` (``h_rule``/``s_rule``/``sx_rule``/``evolve_swap`` in
+``native/pprop_rs/src/lib.rs``) is what actually executes them during
+:meth:`~pprop.propagator.Propagator.propagate`.
 """
 from typing import Dict, List, Optional, Tuple
 
@@ -8,8 +14,6 @@ from pennylane import SX as qmlSX
 from pennylane import Hadamard as qmlH
 from pennylane import S as qmlS
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
 
 # Rule type: maps a single-qubit Pauli label to (output_label, sign).
@@ -53,46 +57,6 @@ class SimpleClifford(Gate):
     ) -> None:
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
-
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this Clifford gate.
-
-        Looks up the single-qubit Pauli at the gate's wire in ``self.rule``.
-        If no rule exists the word commutes with the gate and is returned
-        unchanged. Otherwise the qubit at that wire is replaced with the
-        output label and all scalar coefficients are multiplied by the sign.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair to evolve.
-
-        Returns
-        -------
-        PauliDict
-            A :class:`~pprop.pauli.sentence.PauliDict` with exactly one entry.
-        """
-        op, coeff_terms = word
-        wire = self.wires[0]
-        rule = self.rule.get(op[wire], None)
-
-        # If no rule exists this Pauli commutes with the gate, pass through unchanged.
-        if rule is None:
-            return PauliDict({op: coeff_terms})
-
-        output_label, sign = rule
-
-        new_op = op.copy()
-        new_op.set(wire, output_label)
-
-        # Avoid unnecessary list comprehension when the sign is +1.
-        if sign == 1:
-            new_terms = list(coeff_terms)
-        else:
-            new_terms: CoeffTerms = [(sign * c, s, cc) for c, s, cc in coeff_terms]
-
-        return PauliDict({new_op: new_terms})
 
 
 class H(SimpleClifford):
@@ -206,20 +170,3 @@ class SWAP(Gate):
         from pennylane import SWAP as qmlSWAP
         assert len(wires) == 2, "SWAP requires exactly two wires."
         super().__init__(wires=wires, qml_gate=qmlSWAP, parameter=parameter)
-
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        op, coeff_terms = word
-        w0, w1 = self.wires
-
-        label0 = op[w0]  # Pauli on first wire
-        label1 = op[w1]  # Pauli on second wire
-
-        # If both labels are identical, the word is unchanged (trivially).
-        if label0 == label1:
-            return PauliDict({op: coeff_terms})
-
-        new_op = op.copy()
-        new_op.set(w0, label1)  # put wire-1's label on wire 0
-        new_op.set(w1, label0)  # put wire-0's label on wire 1
-
-        return PauliDict({new_op: list(coeff_terms)})

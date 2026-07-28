@@ -2,6 +2,11 @@
 This submodule defines :class:`ControlledGate`, the base class for two-qubit
 non-parametrised controlled gates, and the concrete gates :class:`CNOT`,
 :class:`CY`, and :class:`CZ`.
+
+The ``rule`` tables below are the human-readable reference for these gates'
+Heisenberg evolution; the Rust extension ``pprop_rs`` (``cnot_rule``/``cy_rule``/
+``cz_rule`` in ``native/pprop_rs/src/lib.rs``) is what actually executes them
+during :meth:`~pprop.propagator.Propagator.propagate`.
 """
 from typing import Dict, List, Optional, Tuple
 
@@ -9,8 +14,6 @@ from pennylane import CNOT as qmlCNOT
 from pennylane import CY as qmlCY
 from pennylane import CZ as qmlCZ
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
 
 # Rule type: maps a two-character Pauli string (control + target) to
@@ -58,49 +61,6 @@ class ControlledGate(Gate):
     ) -> None:
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
-
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this controlled gate.
-
-        Looks up the two-character Pauli string ``op[control] + op[target]``
-        in ``self.rule``. If absent the word commutes with the gate and is
-        returned unchanged. Otherwise both qubits are updated and all scalar
-        coefficients are multiplied by the sign.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair to evolve.
-
-        Returns
-        -------
-        PauliDict
-            One entry (the evolved word).
-        """
-        op, coeff_terms = word
-        wire0, wire1 = self.wires
-
-        # Look up the two-qubit Pauli combination at (control, target).
-        rule = self.rule.get(op[wire0] + op[wire1], None)
-
-        # If no rule exists this Pauli commutes with the gate, pass through unchanged.
-        if rule is None:
-            return PauliDict({op: coeff_terms})
-
-        (out0, out1), sign = rule
-
-        new_op = op.copy()
-        new_op.set(wire0, out0)
-        new_op.set(wire1, out1)
-
-        # Scale coefficients by the sign; avoid unnecessary list comprehension for +1.
-        if sign == 1:
-            new_terms = list(coeff_terms)
-        else:
-            new_terms: CoeffTerms = [(sign * c, s, cc) for c, s, cc in coeff_terms]
-
-        return PauliDict({new_op: new_terms})
 
 
 class CNOT(ControlledGate):

@@ -13,7 +13,6 @@ Submodules
    pprop.gates.rotation
    pprop.gates.simpleclifford
    pprop.gates.simplenonclifford
-   pprop.gates.utils
 
 Module contents
 ---------------

@@ -62,13 +62,9 @@ Propagator
 2: ──H───────────────────||────╰X──||──RY(6.00)─┤      ╰<X@X@X>  <Y> ╰<𝓗(-1.00,13.00)>
 ```
 
-* Propagate the observables:
-```
->>> prop.propagate()
-Propagating 1.0*Z0
-Propagating 1.0*X0 X1 X2
-Propagating 1.0*Y2
-Propagating -1.0*X0 X1 X2 + 13.0*Z2
+* Propagate the observables (this runs in the Rust extension `pprop_rs`, built via `maturin develop` in `native/pprop_rs/`):
+```python
+prop.propagate()
 ```
 
 * Get the output expectation values by calling the class and feeding the circuit's parameters
@@ -86,15 +82,30 @@ prop_output = prop(random_params)
 
 ## Installation
 
-To install the necessary dependencies, run the following command:
+Propagation runs in a Rust extension, so installation is two steps: the
+Python package, then building that extension (needs a Rust toolchain, e.g.
+via [rustup](https://rustup.rs/)):
 
 ```bash
 pip install -e .
+
+pip install maturin
+cd native/pprop_rs
+maturin develop --release
 ```
+
+`maturin develop` builds `pprop_rs` and installs it straight into the active
+virtual environment. Re-run it after pulling changes to `native/pprop_rs`.
 
 ## Examples
 
-For detailed examples, please refer to the `notebooks` directory, which contains Jupyter notebooks that demonstrate various use cases and tests of the propagator.
+For detailed examples, please refer to the `notebooks` directory, which
+contains Jupyter notebooks that demonstrate various use cases and tests of
+the propagator. Running them requires the `notebooks` extra:
+
+```bash
+pip install -e ".[notebooks]"
+```
 
 ## Citation
 If you use this software in your research or publications, **please cite** the following: 
@@ -109,7 +120,7 @@ If you use this software in your research or publications, **please cite** the f
   month        = feb,
   year         = 2026,
   publisher    = {Zenodo},
-  version      = {v2.0.0},
+  version      = {v3.0.0},
   doi          = {10.5281/zenodo.18698922},
   url          = {https://doi.org/10.5281/zenodo.18698922},
   swhid        = {swh:1:dir:026dd224bb89ab9621c3cd71e4b40b35893daec9
@@ -120,7 +131,3 @@ If you use this software in your research or publications, **please cite** the f
                   },
 }
 ```
-
-## TODO
-
-- Add more tutorials (generation, compression)

@@ -7,8 +7,7 @@ Submodules
 .. toctree::
    :maxdepth: 4
 
-   pprop.propagator.evolve
-   pprop.propagator.pruning
+   pprop.propagator.binding
    pprop.propagator.utils
 
 Module contents

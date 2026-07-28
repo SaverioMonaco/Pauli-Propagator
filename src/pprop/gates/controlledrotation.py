@@ -36,32 +36,47 @@ tuples with repeated indices:
     Rules involving ``cos(θ/2)`` or ``sin(θ/2)`` (e.g. the ``"XI"``, ``"YI"``
     entries) cannot be represented exactly as :data:`~pprop.pauli.sentence.CoeffTerm`
     tuples in ``θ``, only in ``θ/2``.  To match PennyLane's output exactly,
-    **the user must pass** ``θ/2`` **as the parameter** for any ``CRX``,
-    ``CRY``, or ``CRZ`` gate in the ansatz:
+    write the ansatz normally, with the gate reading the same trainable index
+    as any other rotation, and instead **halve that index's entry in the
+    array you pass to** :meth:`~pprop.propagator.Propagator.__call__` **or**
+    :meth:`~pprop.propagator.Propagator.eval_and_grad`:
 
     .. code-block:: python
 
-        # Correct: pass theta/2 so that pprop and PennyLane agree
-        qml.CRX(params[i] / 2, wires=[0, 1])
+        # Ansatz: write it exactly like a normal PennyLane circuit.
+        def ansatz(params):
+            qml.CRX(params[0], wires=[0, 1])
+            ...
 
-        # Wrong: pprop will NOT match PennyLane
-        qml.CRX(params[i], wires=[0, 1])
+        prop = Propagator(ansatz)
+        prop.propagate()
+
+        # Correct: halve theta at eval time, not inside the ansatz.
+        prop(np.array([theta / 2, ...]))
+
+        # Wrong: passing theta unmodified will NOT match PennyLane's
+        # qml.CRX(theta, wires=[0, 1]).
+        prop(np.array([theta, ...]))
+
+    Do **not** write ``qml.CRX(params[i] / 2, wires=...)`` in the ansatz
+    itself: since ``Propagator`` captures gate parameters by their *type*
+    (``int``/``np.integer`` means trainable index, ``float`` means a fixed,
+    non-trainable value, see :class:`~pprop.gates.base.Gate`), dividing the
+    placeholder index by 2 during capture turns it into a fixed float instead
+    of halving the trainable value at evaluation time.
 
     The ``(1 \\pm \\cos\\theta)/2`` and ``\\sin(\\theta)/2`` factors (e.g.
     ``"IY"``, ``"ZZ"`` entries) are represented exactly in ``θ`` and require
-    no rescaling.
+    no rescaling, but are still read from the same halved slot for uniformity.
 """
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from numpy import cos, integer, intp, prod, sin
 from pennylane import CRX as qmlCRX
 from pennylane import CRY as qmlCRY
 from pennylane import CRZ as qmlCRZ
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
 
 # ---------------------------------------------------------------------------
@@ -126,73 +141,17 @@ class ControlledRotationGate(Gate):
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
 
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this controlled rotation gate.
-
-        For each matching rule entry the existing :data:`CoeffTerms` are
-        scaled by the rule's multiplier: the multiplier's ``sin_idx`` and
-        ``cos_idx`` (which use ``-1`` as a placeholder) are substituted with
-        ``self.parameter`` and then appended to every existing term's
-        index lists.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair to evolve.
-
-        Returns
-        -------
-        PauliDict
-            Evolved Pauli words with updated :data:`CoeffTerms`.
-        """
-        op, coeff_terms = word
-        wire0, wire1 = self.wires
-        p = self.parameter
-
-        rule = self.rule.get(op[wire0] + op[wire1], None)
-
-        # Word commutes with the gate, pass through unchanged.
-        if rule is None:
-            return PauliDict({op: coeff_terms})
-
-        evolved = PauliDict()
-
-        for output_label, (m_coeff, m_sin, m_cos) in rule:
-            # Build the output Pauli word.
-            new_op = op.copy()
-            new_op.set(wire0, output_label[0])
-            new_op.set(wire1, output_label[1])
-
-            # Substitute the placeholder -1 with the actual parameter index.
-            sin_ext = [p if i == _P else i for i in m_sin]
-            cos_ext = [p if i == _P else i for i in m_cos]
-
-            # Scale each existing term by the multiplier and extend index lists.
-            new_terms: CoeffTerms = []
-            for c, s, cc in coeff_terms:
-                if isinstance(self.parameter, (integer, intp)):
-                    new_terms.append((
-                        m_coeff * c,
-                        list(s) + sin_ext,
-                        list(cc) + cos_ext,
-                    ))
-                else:
-                    new_terms.append((
-                        m_coeff * c * prod(sin(sin_ext)) * prod(cos(cos_ext)),
-                        list(s),
-                        list(cc),
-                    ))
-
-            if new_terms:
-                evolved.add_terms(new_op, new_terms)
-
-        return evolved
-
 
 # ---------------------------------------------------------------------------
 # Concrete gates
 # ---------------------------------------------------------------------------
+#
+# These rule tables are the human-readable reference for CRX/CRY/CRZ's
+# Heisenberg evolution; the Rust extension pprop_rs (crx_rule/cry_rule/
+# crz_rule in native/pprop_rs/src/lib.rs) is what actually executes them
+# during Propagator.propagate(), using -1 -> 0/1/2 repetitions of the
+# parameter index in place of the _P placeholder substitution the removed
+# evolve() method used to do here.
 
 class CRX(ControlledRotationGate):
     r"""
@@ -209,7 +168,9 @@ class CRX(ControlledRotationGate):
 
     .. note::
         The parameter ``θ`` here corresponds to ``θ/2`` in PennyLane's convention.
-        Pass ``params[i] / 2`` to ``qml.CRX`` to match.
+        Write ``qml.CRX(params[i], wires=...)`` normally in the ansatz, and pass
+        ``params[i] / 2`` (not the ansatz) to ``Propagator.__call__``/
+        ``eval_and_grad`` to match PennyLane's ``qml.CRX(theta, ...)``.
 
     Parameters
     ----------
@@ -280,7 +241,9 @@ class CRY(ControlledRotationGate):
 
     .. note::
         The parameter ``θ`` here corresponds to ``θ/2`` in PennyLane's convention.
-        Pass ``params[i] / 2`` to ``qml.CRY`` to match.
+        Write ``qml.CRY(params[i], wires=...)`` normally in the ansatz, and pass
+        ``params[i] / 2`` (not the ansatz) to ``Propagator.__call__``/
+        ``eval_and_grad`` to match PennyLane's ``qml.CRY(theta, ...)``.
 
     Parameters
     ----------
@@ -343,7 +306,9 @@ class CRZ(ControlledRotationGate):
 
     .. note::
         The parameter ``θ`` here corresponds to ``θ/2`` in PennyLane's convention.
-        Pass ``params[i] / 2`` to ``qml.CRZ`` to match.
+        Write ``qml.CRZ(params[i], wires=...)`` normally in the ansatz, and pass
+        ``params[i] / 2`` (not the ansatz) to ``Propagator.__call__``/
+        ``eval_and_grad`` to match PennyLane's ``qml.CRZ(theta, ...)``.
 
     Parameters
     ----------

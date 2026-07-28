@@ -2,14 +2,17 @@
 This submodule defines :class:`SimpleNonClifford`, the base class for
 single-qubit non-parametrised non-Clifford gates, and the concrete gate
 :class:`T`.
+
+The ``rule`` table below is the human-readable reference for T's Heisenberg
+evolution; the Rust extension ``pprop_rs`` (``t_rule`` in
+``native/pprop_rs/src/lib.rs``) is what actually executes it during
+:meth:`~pprop.propagator.Propagator.propagate`.
 """
 from math import sqrt
 from typing import Dict, List, Optional, Tuple
 
 from pennylane import T as qmlT
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
 
 # Rule type: maps a single-qubit Pauli label to two (output_label, phase) pairs.
@@ -55,51 +58,6 @@ class SimpleNonClifford(Gate):
     ) -> None:
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
-
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this non-Clifford gate.
-
-        Looks up the single-qubit Pauli at the gate's wire in ``self.rule``.
-        If no rule exists for that label the Pauli word commutes with the gate
-        and is returned unchanged. Otherwise the word is split into two new
-        Pauli words whose scalar coefficients are scaled by the corresponding
-        constant phases.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair to evolve.
-
-        Returns
-        -------
-        PauliDict
-            A :class:`~pprop.pauli.sentence.PauliDict` with either one entry
-            (if the word commutes with the gate) or two entries (if it does not).
-        """
-        op, coeff_terms = word
-        wire = self.wires[0]
-        rule = self.rule.get(op[wire], None)
-
-        # If no rule exists this Pauli commutes with the gate, pass through unchanged.
-        if rule is None:
-            return PauliDict({op: coeff_terms})
-
-        (basis1, phase1), (basis2, phase2) = rule
-
-        # Build the two output Pauli words by updating the qubit at `wire`.
-        new_op1 = op.copy()
-        new_op1.set(wire, basis1)
-
-        new_op2 = op.copy()
-        new_op2.set(wire, basis2)
-
-        # Scale every existing CoeffTerm by the constant phase factor.
-        # sin/cos index lists are copied to avoid mutating the original.
-        scaled1: CoeffTerms = [(phase1 * c, list(s), list(cc)) for c, s, cc in coeff_terms]
-        scaled2: CoeffTerms = [(phase2 * c, list(s), list(cc)) for c, s, cc in coeff_terms]
-
-        return PauliDict({new_op1: scaled1, new_op2: scaled2})
 
 
 class T(SimpleNonClifford):

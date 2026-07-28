@@ -1,22 +1,16 @@
 [project]
 name = "Pauli-Propagation"
-version = "2.0.1"
+version = "3.0.0"
 authors = [{ name = "Saverio Monaco", email = "saverio.monaco@desy.de" }]
 description = "A Pennylane-based toolkit for approximate symbolic Pauli propagation and evaluation of quantum circuit observables."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ipykernel>=6.29.5",
-    "matplotlib>=3.10.3",
     "pennylane==0.42.3",
     "sympy>=1.14.0",
-    "tqdm>=4.67.1",
-    "h5py==3.14.0",
-    "numba==0.62.0",
     "jax==0.5.0",
     "jaxlib==0.5.0",
     "optax==0.2.4",
-    "wandb>=0.19",
 ]
 
 [tool.mypy]
@@ -31,3 +25,5 @@ packages = ["src/pprop"]
 
 [project.optional-dependencies]
 dev = ["sphinx>=7", "furo", "myst-parser"]
+notebooks = ["matplotlib>=3.10.3", "ipykernel>=6.29.5"]
+scripts = ["wandb>=0.19", "pillow", "qiskit", "qiskit-ibm-runtime"]

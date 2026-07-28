@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from pennylane import Identity, X, Y, Z
+from pennylane import X, Y, Z
 
 
 class PauliOp:
@@ -49,17 +49,6 @@ class PauliOp:
         Bitmask encoding the qubits that carry an X or Y factor. Defaults to 0 (all identity).
     z : int, optional
         Bitmask encoding the qubits that carry a Z or Y factor. Defaults to 0 (all identity).
-
-    Examples
-    --------
-    >>> PauliOp(0b101, 0b110)
-    Y0 Z1 X2
-
-    >>> PauliOp(0b1001)
-    X0 X3
-
-    >>> PauliOp()
-    I
     """
 
     __slots__ = ("x", "z")
@@ -98,170 +87,6 @@ class PauliOp:
         if not isinstance(other, PauliOp):
             return NotImplemented
         return self.x == other.x and self.z == other.z
-
-    def __getitem__(self, qubit: int) -> str:
-        """
-        Return the single-qubit Pauli operator at ``qubit``.
-
-        Parameters
-        ----------
-        qubit : int
-            Zero-based qubit index.
-
-        Returns
-        -------
-        str
-            One of ``"X"``, ``"Y"``, ``"Z"``, or ``"I"``.
-        """
-        x_bit = (self.x >> qubit) & 1
-        z_bit = (self.z >> qubit) & 1
-        if x_bit and z_bit:
-            return "Y"
-        elif x_bit:
-            return "X"
-        elif z_bit:
-            return "Z"
-        else:
-            return "I"
-
-    def set(self, qubit: int, op: str) -> None:
-        """
-        Set the Pauli operator on a specific qubit in-place.
-
-        Updates the ``x`` and ``z`` bitmasks at bit position ``qubit`` to
-        reflect the requested operator according to the bitmask convention.
-
-        Parameters
-        ----------
-        qubit : int
-            Zero-based qubit index to update.
-        op : str
-            Target operator; one of ``"I"``, ``"X"``, ``"Y"``, or ``"Z"``.
-
-        Raises
-        ------
-        ValueError
-            If ``op`` is not one of the four valid Pauli operators.
-        """
-        if op == "X":
-            self.x |=  (1 << qubit)   # set x bit
-            self.z &= ~(1 << qubit)   # clear z bit
-        elif op == "Y":
-            self.x |= (1 << qubit)    # set both bits
-            self.z |= (1 << qubit)
-        elif op == "Z":
-            self.x &= ~(1 << qubit)   # clear x bit
-            self.z |=  (1 << qubit)   # set z bit
-        elif op == "I":
-            self.x &= ~(1 << qubit)   # clear both bits
-            self.z &= ~(1 << qubit)
-        else:
-            raise ValueError(f"Invalid Pauli operator '{op}'; expected 'I', 'X', 'Y', or 'Z'")
-
-    def qubits(self) -> set[int]:
-        """
-        Return the set of qubits where this word acts non-trivially (not as I).
-
-        Returns
-        -------
-        set[int]
-            Qubit indices where ``self[k] != "I"``.
-        """
-        active = set()
-        # Only need to inspect bits up to the highest set bit across both masks.
-        n = max(int(self.x).bit_length(), int(self.z).bit_length())
-        for i in range(n):
-            if ((self.x >> i) & 1) or ((self.z >> i) & 1):
-                active.add(i)
-        return active
-
-    def weight(self) -> int:
-        """
-        Return the Pauli weight, i.e. the number of non-identity single-qubit factors.
-
-        Computed as the popcount of ``x | z``: a qubit is non-identity if and
-        only if at least one of its ``x`` or ``z`` bits is set.
-
-        Returns
-        -------
-        int
-            Number of qubits where the operator is X, Y, or Z.
-        """
-        return (self.x | self.z).bit_count()
-
-    def zerobracket(self) -> bool:
-        """
-        Return ``True`` if this Pauli word has zero expectation in all but the Z/I basis.
-
-        A Pauli word :math:`P` satisfies :math:`\\langle 0 | P | 0 \\rangle \\neq 0`
-        if and only if every single-qubit factor is either :math:`Z` or :math:`I`.
-        This is equivalent to checking that no X bit is set (``x == 0``).
-
-        Returns
-        -------
-        bool
-        """
-        return self.x == 0
-
-    def zerobracket_X(self) -> bool:
-        """
-        Return True if this Pauli word has nonzero expectation in |+><+|,
-        i.e. it is a pure X or I string (no Z or Y).
-
-        Returns
-        -------
-        bool
-        """
-        return self.z == 0
-
-    def copy(self) -> PauliOp:
-        """
-        Return a shallow copy of this :class:`PauliOp`.
-
-        Returns
-        -------
-        PauliOp
-            A new instance with identical ``x`` and ``z`` bitmasks.
-        """
-        return PauliOp(self.x, self.z)
-
-    def to_qml(self, indices: list[int]):
-        """
-        Convert this :class:`PauliOp` to a PennyLane operator on a subset of qubits.
-
-        Only the qubits listed in ``indices`` are included; qubits acting as
-        identity are skipped. If all qubits are identity an
-        :class:`~pennylane.Identity` on wire 0 is returned as a fallback.
-
-        Parameters
-        ----------
-        indices : list[int]
-            Qubit indices to include in the operator.
-
-        Returns
-        -------
-        pennylane.operation.Operator
-            Tensor product of single-qubit Pauli operators over ``indices``.
-        """
-        ops = []
-        for k in indices:
-            p = self[k]
-            if p == "X":
-                ops.append(X(k))
-            elif p == "Y":
-                ops.append(Y(k))
-            elif p == "Z":
-                ops.append(Z(k))
-            # Identity factors are omitted from the tensor product.
-
-        if not ops:
-            return Identity(0)
-
-        # Build the tensor product left-to-right using PennyLane's @ operator.
-        result = ops[0]
-        for op in ops[1:]:
-            result @= op
-        return result
 
     @classmethod
     def from_qml(cls, qml_op) -> PauliOp:
@@ -305,22 +130,3 @@ class PauliOp:
             # Identity: both bits stay 0, nothing to do.
 
         return cls(x=x_mask, z=z_mask)
-
-    def __repr__(self) -> str:
-        """
-        Return a human-readable string representation of the Pauli word.
-
-        Returns
-        -------
-        str
-            Space-separated Pauli labels like ``"X0 Y2 Z3"``, or ``"I"`` for
-            the identity word.
-        """
-        result = []
-        # Inspect all bit positions up to the highest set bit in either mask.
-        n_qubits = max(int(self.x).bit_length(), int(self.z).bit_length())
-        for k in range(n_qubits):
-            op = self[k]
-            if op != "I":
-                result.append(f"{op}{k}")
-        return " ".join(result) if result else "I"

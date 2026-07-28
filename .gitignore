@@ -1,4 +1,4 @@
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,7 +6,7 @@ __pycache__/
 *.sage.py
 cython_debug/
 
-# ── Build & packaging ─────────────────────────────────────────────────────────
+# Build & packaging
 .Python
 build/
 develop-eggs/
@@ -32,7 +32,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 wandb/
 
-# ── Virtual environments ───────────────────────────────────────────────────────
+# Virtual environments
 .env
 .venv
 env/
@@ -40,11 +40,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-flo/
 __pypackages__/
 .python-version
 
-# ── Testing & coverage ────────────────────────────────────────────────────────
+# Testing & coverage
 htmlcov/
 .tox/
 .nox/
@@ -59,40 +58,40 @@ coverage.xml
 .pytest_cache/
 cover/
 
-# ── Type checkers & linters ───────────────────────────────────────────────────
+# Type checkers & linters
 .mypy_cache/
 .dmypy.json
 dmypy.json
 .pyre/
 .pytype/
 
-# ── Dependency managers ───────────────────────────────────────────────────────
+# Dependency managers
 .pdm.toml
 # Pipfile.lock
 # poetry.lock
 # pdm.lock
 
-# ── Jupyter & IPython ─────────────────────────────────────────────────────────
+# Jupyter & IPython
 .ipynb_checkpoints
 profile_default/
 ipython_config.py
 
-# ── IDEs & editors ────────────────────────────────────────────────────────────
+# IDEs & editors
 .spyderproject
 .spyproject
 .ropeproject
 # .idea/
 *.code-workspace
 
-# ── Documentation ─────────────────────────────────────────────────────────────
+# Documentation
 docs/_build/
 /site
 
-# ── Translations ──────────────────────────────────────────────────────────────
+# Translations
 *.mo
 *.pot
 
-# ── Python frameworks & misc tools ───────────────────────────────────────────
+# Python frameworks & misc tools
 *.log
 local_settings.py
 db.sqlite3
@@ -105,7 +104,7 @@ target/
 celerybeat-schedule
 celerybeat.pid
 
-# ── LaTeX ─────────────────────────────────────────────────────────────────────
+# LaTeX
 *.aux
 *.bit
 *.blg
@@ -125,21 +124,9 @@ celerybeat.pid
 *.toc
 svg-inkscape/
 
-# ── Project-specific ─────────────────────────────────────────────────────────
-model/
-info/
-.info
-opt_db
-old/
-other/
-bigtest/
-run/
-run*/
-baposter_guide.pdf
-dummy.ipynb
-qag.ipynb
-test.ipynb
+# Project-specific
 test/
-slurm/
-mnist_data/
 scripts/
+personal/
+future/
+.vscode/

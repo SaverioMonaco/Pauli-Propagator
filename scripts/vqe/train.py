@@ -24,7 +24,6 @@ import pennylane as qml
 
 from pprop import Propagator
 from pprop.optimization import adam
-from pprop.propagator.pruning import DeadQubitPruner, XYWeightPruner
 
 sys.path.append('./')
 import ansatz
@@ -58,7 +57,7 @@ def main(
     print("Propagating...")
 
     time_start = time.time()
-    prop.propagate(pruners=[XYWeightPruner(), DeadQubitPruner()])
+    prop.propagate(use_xy_weight_pruner=True, use_dead_qubit_pruner=True)
     time_end = time.time()
     print(f"  Time: {time_end - time_start:.3f} seconds")
 

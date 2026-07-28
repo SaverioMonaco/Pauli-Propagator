@@ -18,11 +18,13 @@ proportional to the multiplicity of O_k in the random batch.
 Each training round:
   1. A fresh batch of random Pauli observables is drawn from a binomial
      distribution parameterised by the MMD bandwidth σ.
-  2. A Propagator for that batch is built and analytically propagated.
-  3. The batch MMD loss is minimised for ``steps_per_round`` steps - via
-     ``pprop.optimization.adam`` (--device cpu) or the JAX-fused
-     ``pprop.optimization.adam_gpu`` (--device gpu, ~8.5x faster at this
-     script's defaults - see notebooks/test/gpu_backend.ipynb).
+  2. A Propagator for that batch is built and analytically propagated. The
+     Rust extension pprop_rs (see pprop.propagator) handles this now, so
+     there's no CPU/GPU backend choice to make here any more (the old
+     --device gpu / backend='vmap' path was removed along with the rest of
+     the Python propagation backends; see docs/rust_port.tex).
+  3. The batch MMD loss is minimised for ``steps_per_round`` steps via
+     ``pprop.optimization.adam``.
 
 Usage
 -----
@@ -30,33 +32,17 @@ Usage
                     --num_steps 20 --k1 6 --k2 20 --seed 0
     python train.py --digits 0 1 --side 8  # train on 0s and 1s only
 
-    # --device: exactly two choices, deliberately (see notebooks/test/gpu_backend.ipynb
-    # for the measurements behind both).
-    #   'cpu' (default) -> backend='sparse' - the best CPU-only Propagator
-    #                       evaluator measured in eval_and_grad_backends.ipynb.
-    #   'gpu'           -> backend='vmap', device='gpu' - measured ~4-9x FASTER
-    #                       than 'sparse' on CPU, for this script's typical
-    #                       --num_obs (the crossover was ~4-16 observables per
-    #                       call). Requires a CUDA-enabled jax/jaxlib. Opt-in
-    #                       only (never automatic) - GPUs are a shared,
-    #                       contended resource.
-    python train.py --device cpu   # same as omitting --device
-    python train.py --device gpu
-
     # --eval_n_jobs threads observable evaluation across CPU cores every Adam
-    # step (backend='standard'/'sparse' only). Left at its default (1) below
-    # deliberately: measured to make every step SLOWER at the term counts
-    # k1/k2 truncation produces (Python's GIL dominates - each observable's
-    # NumPy work is too small, ~0.1-0.2ms, to amortize thread overhead), at
-    # every thread count tried from 2 to "all cores". Don't turn it on unless
-    # you've re-measured for your own k1/k2/circuit and it actually helps.
+    # step. Left at its default (1) below deliberately: measured to make
+    # every step SLOWER at the term counts k1/k2 truncation produces
+    # (Python's GIL dominates - each observable's NumPy work is too small,
+    # ~0.1-0.2ms, to amortize thread overhead), at every thread count tried
+    # from 2 to "all cores". Don't turn it on unless you've re-measured for
+    # your own k1/k2/circuit and it actually helps.
 
-    # Every run logs to Weights & Biases by default (--wandb_mode online),
-    # so all jobs launched by TRAIN_cpu.sh and TRAIN_gpu.sh - regardless of
-    # which node/partition they land on - show up together in one project's
-    # dashboard, grouped by hyperparameters (see --wandb_project/_entity/
-    # _mode and the wandb.init() call below). Use --wandb_mode offline on a
-    # node without internet, or disabled to turn it off entirely.
+    # Every run logs to Weights & Biases by default (--wandb_mode online).
+    # Use --wandb_mode offline on a node without internet, or disabled to
+    # turn it off entirely.
 """
 
 from __future__ import annotations
@@ -76,8 +62,7 @@ import wandb
 from PIL import Image
 
 from pprop import Propagator
-from pprop.optimization import adam as pprop_adam, adam_gpu as pprop_adam_gpu
-from pprop.propagator.pruning import DeadQubitPruner, XYWeightPruner
+from pprop.optimization import adam as pprop_adam
 
 sys.path.append('./')
 import ansatz
@@ -279,9 +264,7 @@ def train(
     k1: int | None = None,
     k2: int | None = None,
     seed: int = 0,
-    backend: str = "sparse",
     eval_n_jobs: int = 1,
-    device: str | None = None,
     wandb_run: wandb.sdk.wandb_run.Run | None = None,
 ) -> tuple[np.ndarray, list[float], list[float]]:
     rng       = np.random.default_rng(seed)
@@ -300,48 +283,26 @@ def train(
 
         prop = Propagator(circuit_maker(num_qubits, batch_obs), k1=k1, k2=k2)
         prop.propagate(
-            pruners=[XYWeightPruner(), DeadQubitPruner()],
-            num_jobs=args.num_jobs,
-            backend=backend,
+            use_xy_weight_pruner=True, use_dead_qubit_pruner=True,
             eval_n_jobs=eval_n_jobs,
-            device=device,
         )
 
         mu = batch_mu
         w  = weights
 
-        if backend == "vmap":
-            # GPU-fused path (see pprop.optimization.adam_gpu): L must be
-            # jax.numpy, not numpy, since it's traced into the same
-            # jax.lax.scan-compiled program as the propagator's own JAX
-            # computation. grad_L is left to jax.grad(L) - exact, and free
-            # to get from a jnp loss (no separate closed-form needed).
-            import jax.numpy as jnp
-            mu_j, w_j = jnp.asarray(mu), jnp.asarray(w)
+        def L(f_vals: np.ndarray) -> float:
+            return float(np.dot(w, (f_vals - mu) ** 2))
 
-            def L(f_vals):
-                return jnp.dot(w_j, (f_vals - mu_j) ** 2)
+        def grad_L(f_vals: np.ndarray) -> np.ndarray:
+            return 2.0 * w * (f_vals - mu)
 
-            result = pprop_adam_gpu(
-                L, prop, np.array(params),
-                lr          = lr,
-                num_steps   = steps_per_round,
-                print_every = 0,
-            )
-        else:
-            def L(f_vals: np.ndarray) -> float:
-                return float(np.dot(w, (f_vals - mu) ** 2))
-
-            def grad_L(f_vals: np.ndarray) -> np.ndarray:
-                return 2.0 * w * (f_vals - mu)
-
-            result = pprop_adam(
-                L, prop, np.array(params),
-                lr          = lr,
-                num_steps   = steps_per_round,
-                print_every = 0,
-                grad_L      = grad_L,
-            )
+        result = pprop_adam(
+            L, prop, np.array(params),
+            lr          = lr,
+            num_steps   = steps_per_round,
+            print_every = 0,
+            grad_L      = grad_L,
+        )
         params = result["params"]
         round_losses = result["loss_history"]
         all_losses.extend(round_losses)
@@ -382,9 +343,7 @@ def validate(
     k2: int = 20,
     sigma: float = 1.0,
     seed: int = 0,
-    backend: str = "sparse",
     eval_n_jobs: int = 1,
-    device: str | None = None,
 ) -> tuple[float, float]:
     rng_base  = np.random.default_rng(seed)
     mmd_values: list[float] = []
@@ -400,11 +359,8 @@ def validate(
 
         prop = Propagator(circuit_maker(num_qubits, batch_obs), k1=k1, k2=k2)
         prop.propagate(
-            pruners=[XYWeightPruner(), DeadQubitPruner()],
-            num_jobs=args.num_jobs,
-            backend=backend,
+            use_xy_weight_pruner=True, use_dead_qubit_pruner=True,
             eval_n_jobs=eval_n_jobs,
-            device=device,
         )
 
         residuals = prop(params) - batch_mu
@@ -443,43 +399,15 @@ if __name__ == '__main__':
                         help='Directory with (or for) MNIST IDX files.')
     parser.add_argument('--max_train',     type=int,   default=5000,
                         help='Maximum training samples.')
-    parser.add_argument('--num_jobs',     type=int,   default=-1,
-                        help="Worker processes used to propagate observables "
-                             "in parallel (one-time cost per round). -1 "
-                             "(default) uses every core actually allocated "
-                             "to this process (via os.sched_getaffinity, so "
-                             "this respects e.g. 'sbatch --cpus-per-task' "
-                             "rather than the whole node's core count). "
-                             "Avoid passing a number much larger than that: "
-                             "each worker re-imports this whole module tree "
-                             "(PennyLane, JAX, ...), so far more workers than "
-                             "cores just adds startup overhead per round "
-                             "with no extra parallelism to show for it.")
-    parser.add_argument('--device',        type=str,   default='cpu',
-                        choices=['cpu', 'gpu'],
-                        help="Exactly two choices, deliberately (see "
-                             "notebooks/test/gpu_backend.ipynb for the measurements "
-                             "behind both, and eval_and_grad_backends.ipynb for "
-                             "why 'standard' and plain 'vmap' aren't offered "
-                             "here). 'cpu' (default) uses Propagator's "
-                             "backend='sparse' - the best CPU-only evaluator "
-                             "measured for this workload. 'gpu' uses "
-                             "backend='vmap', device='gpu' - measured ~4-9x "
-                             "faster than 'sparse' for this script's typical "
-                             "--num_obs (crossover was ~4-16 observables per "
-                             "call) - requires a CUDA-enabled jax/jaxlib. "
-                             "Opt-in only, never automatic: GPUs on a shared "
-                             "machine are a contended resource.")
     parser.add_argument('--eval_n_jobs',   type=int,   default=1,
                         help="Threads used to evaluate observables in "
-                             "parallel per Adam step (backend='standard'/"
-                             "'sparse' only). Default 1 (sequential) - "
-                             "measured to make every step SLOWER at typical "
+                             "parallel per Adam step. Default 1 (sequential) "
+                             "- measured to make every step SLOWER at typical "
                              "k1/k2-truncated term counts, at every thread "
                              "count tried (Python's GIL dominates when each "
-                             "observable's own NumPy work is this small). "
-                             "-1 uses every core allocated to this process "
-                             "(same convention as --num_jobs) if you want to "
+                             "observable's own NumPy work is this small). -1 "
+                             "uses every core allocated to this process (via "
+                             "os.sched_getaffinity) if you want to "
                              "experiment, but re-measure before trusting it.")
     parser.add_argument('--digits',        type=int,   nargs='+',
                         default=list(range(10)),
@@ -501,33 +429,13 @@ if __name__ == '__main__':
                              "without internet). 'disabled' turns W&B off.")
     args = parser.parse_args()
 
-    # --device is the only user-facing choice; translate it to the
-    # Propagator-level backend/device pair internally. See --device's help
-    # text for why only these two combinations are offered.
-    backend = "sparse" if args.device == "cpu" else "vmap"
-    device  = None     if args.device == "cpu" else "gpu"
-
-    if backend == "vmap" and args.num_jobs != 1:
-        # Propagator.propagate's docstring: num_jobs > 1 forks worker
-        # processes AFTER JAX may have started background threads (which
-        # happens as soon as backend="vmap" runs anything), and forking a
-        # multithreaded process can deadlock the child. This isn't
-        # hypothetical - it reproduces intermittently, not every run - so
-        # don't leave it to chance: force num_jobs=1 whenever --device gpu
-        # is selected, regardless of what --num_jobs was passed.
-        print(f"--device gpu forces num_jobs=1 (was {args.num_jobs}) - "
-              "forking worker processes after JAX starts threads risks a "
-              "deadlock, see Propagator.propagate's docstring.")
-        args.num_jobs = 1
     try:
         allocated_cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         allocated_cpus = os.cpu_count()
     print(f"CPUs allocated to this process: {allocated_cpus}  "
-          f"(--num_jobs={args.num_jobs}, --eval_n_jobs={args.eval_n_jobs}; "
+          f"(--eval_n_jobs={args.eval_n_jobs}; "
           f"-1 means 'use all {allocated_cpus} of them')")
-    print(f"--device {args.device}  ->  Propagator backend={backend!r}"
-          + (f", device={device!r}" if device else ""))
 
     # Validate digit values
     invalid = [d for d in args.digits if not (0 <= d <= 9)]
@@ -545,20 +453,17 @@ if __name__ == '__main__':
     out_path.mkdir(parents=True, exist_ok=True)
 
     # group=<hyperparams, no seed> lets the dashboard fold every seed of a
-    # given (side, num_obs, lr, k1, k2, digits, device) combo into one card;
+    # given (side, num_obs, lr, k1, k2, digits) combo into one card;
     # name=<...+seed> keeps individual runs distinguishable within a group.
-    # Both CPU and GPU sweeps share the same --path/folder_name convention,
-    # so args.device is appended explicitly to avoid CPU/GPU runs of an
-    # otherwise-identical hyperparameter grid colliding into the same group.
-    wandb_group = f"{folder_name}_{args.device}"
+    wandb_group = folder_name
     wandb_run = wandb.init(
         project = args.wandb_project,
         entity  = args.wandb_entity,
         mode    = args.wandb_mode,
         group   = wandb_group,
         name    = f"{wandb_group}_seed{args.seed}",
-        tags    = [args.device, f"digits{digits_tag}"],
-        config  = {**vars(args), "backend": backend, "num_qubits": num_qubits},
+        tags    = [f"digits{digits_tag}"],
+        config  = {**vars(args), "num_qubits": num_qubits},
     )
 
     print(f"Training on digits: {sorted(args.digits)}")
@@ -589,9 +494,7 @@ if __name__ == '__main__':
         k1              = args.k1,
         k2              = args.k2,
         seed            = args.seed,
-        backend         = backend,
         eval_n_jobs     = args.eval_n_jobs,
-        device          = device,
         wandb_run       = wandb_run,
     )
 
@@ -608,8 +511,7 @@ if __name__ == '__main__':
         n_obs=100, n_samples=10,
         k1=args.k1, k2=args.k2,
         sigma=sigma, seed=args.seed,
-        backend=backend, eval_n_jobs=args.eval_n_jobs,
-        device=device,
+        eval_n_jobs=args.eval_n_jobs,
     )
     print(f"Test MMD: {test_mmd_mean:.6f} ± {test_mmd_std:.6f}")
     wandb_run.log({"test/mmd_mean": test_mmd_mean, "test/mmd_std": test_mmd_std})

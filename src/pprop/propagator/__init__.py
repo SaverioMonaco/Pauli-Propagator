@@ -1,7 +1,14 @@
 """
-Core module with the Propagator. 
-Propagator takes as an input a quantum circuit as a function of a list of parameters List[float] and returns 
+Core module with the Propagator.
+Propagator takes as an input a quantum circuit as a function of a list of parameters List[float] and returns
 the expectation value of an observable.
+
+Propagation itself (the Heisenberg-picture evolution of each observable
+backward through the circuit's gates) runs entirely in the Rust extension
+``pprop_rs``. This fork of pprop has no pure-Python propagation path anymore.
+See ``native/pprop_rs`` and ``personal/rust_port.tex`` for why, and for measured
+performance numbers versus the pure-Python implementation this replaced.
+
 >>> from pprop import Propagator
 >>> import pennylane as qml
 >>> def ansatz(params):
@@ -15,29 +22,55 @@ the expectation value of an observable.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from multiprocessing import get_context
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
-from numpy import arange, array, cos, ndarray, sin, stack
+from numpy import arange, array, cos, empty, integer, ndarray, sin
 from pennylane import draw
 from pennylane.tape import QuantumTape
 
+import pprop_rs
+
 from .. import gates
 from ..pauli.sentence import PauliDict
-from .evolve import heisenberg
-from .pruning import Pruner
-from .truncation import FrequencyTruncation, Truncation, WeightTruncation
-from .utils import (
-    make_evaluator,
-    make_sparse_evaluator,
-    remove_duplicate_observables,
-    requires_propagation,
-)
+from .binding import BoundPropagator, Free, affine_from_exprs
+from .utils import make_sparse_evaluator, remove_duplicate_observables, requires_propagation
 
-#: Evaluator backends accepted by :meth:`Propagator.propagate`. See that
-#: method's docstring for what each one trades off.
-_BACKENDS = ("standard", "sparse", "vmap")
+#: Gate class name (pennylane's Operator.name) -> pprop_rs gate-kind code.
+#: Must stay in sync with the kind constants at the top of
+#: native/pprop_rs/src/lib.rs.
+_GATE_KIND = {
+    "RX": 0, "RY": 1, "RZ": 2,
+    "Hadamard": 3, "S": 4, "SX": 5, "T": 6,
+    "SWAP": 7, "CNOT": 8, "CY": 9, "CZ": 10,
+    "CRX": 11, "CRY": 12, "CRZ": 13,
+}
+
+
+def _words_needed(num_qubits: int) -> int:
+    """
+    Smallest power-of-two count of 64-bit words covering ``num_qubits``.
+
+    Must match ``words_needed()`` in ``native/pprop_rs/src/lib.rs`` exactly -
+    it picks which of that file's const-generic ``NW`` monomorphizations
+    handles this circuit, and this function picks how many ``u64`` limbs
+    :func:`_int_to_words` chunks each :class:`~pprop.pauli.op.PauliOp` into
+    for the trip across that boundary. A mismatch would silently truncate
+    high qubit indices.
+    """
+    raw = max(1, -(-num_qubits // 64))  # ceil(num_qubits / 64), at least 1
+    return 1 << (raw - 1).bit_length()
+
+
+def _int_to_words(value: int, n_words: int) -> list[int]:
+    """
+    Chunk a non-negative arbitrary-precision int into ``n_words`` little-endian u64 limbs.
+
+    :class:`~pprop.pauli.op.PauliOp` stores ``x``/``z`` as plain Python ints
+    (no qubit-count limit); this is the only place that width gets folded
+    down to the fixed-size ``[u64; NW]`` arrays ``pprop_rs`` operates on.
+    """
+    mask = (1 << 64) - 1
+    return [(value >> (64 * i)) & mask for i in range(n_words)]
 
 
 def _available_cpus() -> int:
@@ -47,10 +80,10 @@ def _available_cpus() -> int:
     ``os.cpu_count()`` reports every core on the node, regardless of any
     cgroup/SLURM allocation - on a shared cluster where a job is only granted
     a fraction of a node's cores (e.g. via ``sbatch --cpus-per-task``),
-    trusting ``os.cpu_count()`` for ``num_jobs=-1``/``eval_n_jobs=-1`` would
-    oversubscribe far past what's actually reserved, hurting this job and
-    whatever else is scheduled on the same node. ``os.sched_getaffinity(0)``
-    respects that allocation on Linux; fall back to ``os.cpu_count()`` where
+    trusting ``os.cpu_count()`` for ``eval_n_jobs=-1`` would oversubscribe
+    far past what's actually reserved, hurting this job and whatever else is
+    scheduled on the same node. ``os.sched_getaffinity(0)`` respects that
+    allocation on Linux; fall back to ``os.cpu_count()`` where
     ``sched_getaffinity`` doesn't exist (e.g. macOS).
     """
     try:
@@ -58,13 +91,6 @@ def _available_cpus() -> int:
     except AttributeError:
         return os.cpu_count() or 1
 
-
-def _propagate_one(paulidict, gates, debug, pruners, truncations):
-    """Module-level wrapper around heisenberg() so it can be pickled and
-    sent to worker processes. multiprocessing can't pickle bound methods
-    or closures reliably, so this has to live at module scope.
-    """
-    return heisenberg(gates, paulidict, debug, pruners, truncations)
 
 class Propagator:
     """
@@ -74,6 +100,9 @@ class Propagator:
     converts its gates to internal :mod:`pprop.gates` representations, and exposes
     methods to propagate observables backwards through the circuit via the Heisenberg
     picture, then evaluate expectations and gradients.
+
+    Circuits are still defined with PennyLane, exactly as before. Only the
+    propagation step itself (:meth:`propagate`) has moved to Rust.
 
     Parameters
     ----------
@@ -105,7 +134,10 @@ class Propagator:
     num_qubits : int
         Number of qubits used by the ansatz, inferred from the tape wires.
     num_params : int
-        Number of trainable parameters, inferred as ``max(parameter_indices) + 1``.
+        Number of trainable parameters, inferred as ``max(parameter_indices) + 1``
+        over gates given an int/``np.integer`` parameter. Gates given a plain
+        float parameter (e.g. ``qml.RY(0.3, wires=q)``) are fixed, non-trainable
+        values and don't count towards this: see :attr:`_fixed_value_slots`.
     k1 : int or None
         Pauli weight cutoff passed to the propagation routine.
     k2 : int or None
@@ -115,35 +147,32 @@ class Propagator:
         ``(coeff, sin_indices, cos_indices)`` tuples that together encode the
         symbolic expectation value for the corresponding observable.
     _eval_list : list[Callable]
-        Populated by :meth:`propagate` (``backend in ("standard", "sparse")``
-        only - empty for ``"vmap"``). Fast numeric evaluators
+        Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> float`` for each observable, where ``sins`` and
         ``coss`` are ``sin(theta)``/``cos(theta)`` - computed once per
         :meth:`__call__` and shared across every observable rather than each
         one recomputing them from ``theta``.
     _eval_and_grad_list : list[Callable]
-        Populated by :meth:`propagate` (``backend in ("standard", "sparse")``
-        only - empty for ``"vmap"``). Fast numeric evaluators
+        Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> (float, ndarray)`` returning value and gradient for
         each observable, with ``sins``/``coss`` as above.
+    _fixed_value_slots : dict[float, int]
+        Maps each distinct fixed gate value to a hidden slot index right
+        after the trainable range ``[0, num_params)``. Populated once in
+        :meth:`__init__`; empty (and free of overhead) for circuits with no
+        fixed-value gates.
+    _internal_num_params : int
+        ``num_params`` plus the number of distinct fixed values, i.e. the
+        width of the padded array :meth:`_full_params` builds before every
+        ``sin``/``cos`` evaluation.
     _propagated : bool
         Internal flag; ``True`` after :meth:`propagate` has been called
         successfully. Guards methods decorated with :func:`~.utils.requires_propagation`.
-    backend : str
-        Populated by :meth:`propagate`. One of ``"standard"``, ``"sparse"``,
-        ``"vmap"`` - which evaluator implementation ``__call__`` and
-        :meth:`eval_and_grad` use. See :meth:`propagate`'s docstring for the
-        trade-offs.
-    device : str or None
-        Populated by :meth:`propagate`. Only meaningful for
-        ``backend="vmap"`` - ``None`` unless explicitly requested. See
-        :meth:`propagate`'s ``device`` parameter.
     eval_n_jobs : int
         Populated by :meth:`propagate`. Number of threads used to evaluate
-        observables in parallel (``backend in ("standard", "sparse")`` only).
-        Leave at ``1`` (the default) unless you've measured otherwise for
-        your workload - see :meth:`propagate`'s docstring; this was measured
-        to hurt, not help, at typical k1/k2-truncated term counts.
+        observables in parallel. Leave at ``1`` (the default) unless you've
+        measured otherwise for your workload: each observable's evaluation
+        is typically too cheap (~0.1-0.2ms) for threading to pay off.
 
     Examples
     --------
@@ -199,7 +228,7 @@ class Propagator:
                 parameter = op.parameters[0] if len(op.parameters) == 1 else None
                 gate = getattr(gates, op.name)(op.wires, parameter)
                 self.gates.append(gate)
-            elif op.name == "Barrier": 
+            elif op.name == "Barrier":
                 # Barriers are PennyLane no-ops used only for circuit drawing;
                 # they carry no physical meaning and can be safely ignored.
                 pass
@@ -209,278 +238,154 @@ class Propagator:
         # Store tape operations and qubit count
         self.num_qubits : int = len(self.tape.wires)
 
-        # Determine the number of trainable parameters
-        params = [int(op.parameters[0]) for op in self.tape.operations if len(op.parameters) == 1]
-        self.num_params : int = max(params) + 1 if params else 0
-            
+        # Determine the number of trainable parameters. Only int/np.integer
+        # parameters are real trainable indices (see Gate's docstring); a
+        # float parameter (e.g. qml.RY(0.3, wires=q), or any arithmetic on
+        # the placeholder that promotes it to float) is a *fixed*, non
+        # trainable value and must not be counted or truncated into an index.
+        index_params = [
+            int(g.parameter) for g in self.gates
+            if g.parameter is not None and isinstance(g.parameter, (int, integer))
+        ]
+        self.num_params : int = max(index_params) + 1 if index_params else 0
+
+        # Fixed-value gates don't get a user-facing slot in `num_params`;
+        # instead each *distinct* fixed value is assigned its own hidden slot
+        # right after the real trainable indices, so it can still flow through
+        # the same sin(theta)/cos(theta) machinery as everything else.
+        # `_full_params` splices these constants in before every evaluation.
+        self._fixed_value_slots : dict = {}
+        next_slot = self.num_params
+        for g in self.gates:
+            if g.parameter is not None and not isinstance(g.parameter, (int, integer)):
+                value = float(g.parameter)
+                if value not in self._fixed_value_slots:
+                    self._fixed_value_slots[value] = next_slot
+                    next_slot += 1
+        self._internal_num_params : int = next_slot
+
         # Guards __call__ and eval_and_grad until propagate() has been run.
         self._propagated : bool = False
-        
+
     # --------------- -
-    # Public methods 
+    # Public methods
     # --------------- -
     def propagate(
         self,
-        debug: bool = False,
-        pruners: List[Pruner] = [],
-        truncations: List[Truncation] = [],
-        num_jobs: int = 1,
-        backend: str = "standard",
+        use_dead_qubit_pruner: bool = False,
+        use_xy_weight_pruner: bool = False,
+        coeff_threshold: Optional[float] = None,
         eval_n_jobs: int = 1,
-        device: Optional[str] = None,
     ):
         """
         Propagate each observable backwards through the circuit (Heisenberg picture).
 
-        Evolves each entry of :attr:`paulidicts` through :attr:`gates` in
-        reverse (the Heisenberg picture), accumulating the symbolic
-        trigonometric expression for its expectation value into
-        :attr:`exprs`, then compiles each expression into fast numeric
-        callables (:attr:`_eval_list`/:attr:`_eval_and_grad_list`, or a
-        single batched callable for ``backend="vmap"``). Idempotent - calling
-        this again after a successful call is a no-op (prints a notice and
-        returns).
+        Evolves every entry of :attr:`paulidicts` through :attr:`gates` in
+        reverse (the Heisenberg picture) inside the Rust extension
+        ``pprop_rs``, accumulating each observable's symbolic
+        trigonometric expectation-value expression into :attr:`exprs`, then
+        compiles each expression into a fast numeric callable
+        (:attr:`_eval_list`/:attr:`_eval_and_grad_list`, via the "sparse"
+        gathered-array representation; see ``utils.make_sparse_evaluator``).
+        Idempotent: calling this again after a successful call is a no-op
+        (prints a notice and returns).
 
         Parameters
         ----------
-        debug : bool, optional
-            Print each :class:`~pprop.pauli.sentence.PauliDict` as it is
-            propagated. Defaults to ``False``.
-        pruners : list[Pruner], optional
-            Extra pruning strategies applied during propagation, in addition
-            to (not instead of) the built-in ``k1``/``k2`` truncations set at
-            construction time. Defaults to ``[]``.
-        truncations : list[Truncation], optional
-            Extra truncation strategies applied during propagation, in
-            addition to the built-in ``k1``/``k2`` ones. Defaults to ``[]``.
-        num_jobs : int, optional
-            Number of worker processes used to propagate observables in
-            parallel. Each entry in :attr:`paulidicts` is evolved
-            independently, so this loop parallelizes cleanly across
-            processes. Defaults to ``1`` (sequential — identical behaviour
-            and ordering to before). Pass ``-1`` to use all available cores
-            (:func:`_available_cpus` - respects a cgroup/SLURM allocation
-            rather than the whole node's core count), or any positive
-            integer for that many worker processes. Requires :attr:`gates`,
-            ``pruners``, and ``truncations`` to be picklable. When
-            ``num_jobs > 1`` and ``debug=True``, printed output from
-            different observables will be interleaved/out of order since it
-            comes from separate processes. Workers use the platform-default
-            start method (``"fork"`` on Linux). **Known issue:** combining
-            ``num_jobs > 1`` with ``backend="vmap"`` in the same process can
-            deadlock - forking after JAX has started its background threads
-            can inherit a mutex mid-hold by a thread that no longer exists in
-            the child. (``"spawn"`` avoids that specific bug but was measured
-            far slower here - every worker re-imports this whole module tree,
-            PennyLane and JAX included, from scratch - so it was not adopted;
-            see ``tests/test_eval_and_grad_jit_bench.py``/the vmap backend's
-            module docstring for the current state of this trade-off.) Until
-            resolved, use ``num_jobs=1`` when propagating with
-            ``backend="vmap"``.
-
-            Note ``num_jobs`` only affects *propagation* (this one-time setup
-            step); it has nothing to do with ``eval_n_jobs`` below, which
-            affects every subsequent call to :meth:`__call__`/:meth:`eval_and_grad`.
-        backend : {"standard", "sparse", "vmap"}, optional
-            Which evaluator implementation to build once propagation
-            finishes. All three compute *exactly* the same values and
-            gradients (verified in ``tests/test_backends.py``) - this only
-            picks the internal representation, purely a speed/engineering
-            trade-off. See ``notebooks/test/sparse_arrays_explained.ipynb``
-            and ``tests/test_eval_and_grad_jit_bench.py`` for how these were
-            benchmarked. Defaults to ``"standard"`` (unchanged behaviour from
-            previous versions of this library).
-
-            - ``"standard"``: the original dense ``(n_terms, num_params)``
-              arrays (:func:`~.utils.make_evaluator`). Safe default; every
-              term carries one column per circuit parameter even if it only
-              touches a handful of them.
-            - ``"sparse"``: narrower ``(n_terms, W)`` gathered arrays
-              (:func:`~.utils.make_sparse_evaluator`), ``W`` = the most
-              parameters any single term touches. Same NumPy, same single-core
-              execution model as ``"standard"`` - just less wasted work per
-              term. Measured ~6x faster than ``"standard"`` at k1/k2
-              truncation levels that keep terms narrow (the more aggressive
-              your truncation, the bigger the win). **Recommended starting
-              point if training is slow.**
-            - ``"vmap"``: batches *all* observables into a single
-              ``jax.jit`` + ``jax.vmap`` call
-              (:func:`~.vmap_backend.make_batched_evaluator`), built on the
-              same sparse arrays as ``"sparse"``. On CPU this was measured
-              *slower* than ``"sparse"`` in every test so far (JAX's gradient
-              scatter-add is disproportionately expensive on CPU) - **on
-              GPU it flips**: ~70-80x faster than the same batch on CPU, and
-              ~4x faster than ``"sparse"`` on CPU, at the 1000-observable
-              scale measured in ``notebooks/test/gpu_backend.ipynb``. That GPU win
-              only materialises for a large batch of observables evaluated
-              together, though - per-call dispatch/transfer overhead
-              dominates for the common case of propagating a handful of
-              observables at a time (MMD-style training with hundreds of
-              observables per round, as in ``scripts/generation/train.py``,
-              is the exception, not the rule) - which is why ``"sparse"``
-              remains the default even when a GPU is available. See
-              ``device`` below to opt into GPU explicitly. Requires
-              `jax`/`jaxlib` (already a project dependency; GPU support
-              additionally requires a CUDA-enabled jaxlib/plugin - see
-              ``notebooks/test/gpu_backend.ipynb`` for the install command).
-              Ignores ``eval_n_jobs`` (there's no per-observable Python loop
-              left to parallelize - everything happens in one compiled call).
+        use_dead_qubit_pruner : bool, optional
+            Enable ``DeadQubitPruner``: exact pruning of words carrying a
+            frozen X/Y on a qubit no remaining gate can ever touch again.
+            Defaults to ``False`` (matches the previous default of not
+            passing any pruners).
+        use_xy_weight_pruner : bool, optional
+            Enable ``XYWeightPruner``: exact pruning of words whose XY-weight
+            exceeds the maximum reduction achievable by the remaining
+            circuit. Defaults to ``False``.
+        coeff_threshold : float, optional
+            If given, any :data:`~pprop.pauli.sentence.CoeffTerm` whose
+            scalar magnitude falls below this threshold is discarded after
+            every gate step. This is approximate, equivalent to the old
+            ``CoefficientTruncation``. ``None`` (default) disables this.
         eval_n_jobs : int, optional
             Number of threads used to evaluate observables in parallel on
-            every call to :meth:`__call__`/:meth:`eval_and_grad`, for
-            ``backend in ("standard", "sparse")``. Defaults to ``1``
-            (sequential Python loop - this is the recommended value).
-
-            **Measured not to help, and often to hurt**, at the term counts
-            k1/k2 truncation actually produces (tens to a few hundred terms
-            per observable): each observable's evaluation only takes on the
-            order of 0.1-0.2 ms, which is too little NumPy-releases-the-GIL
-            work per call to amortize Python's GIL acquire/release and
-            thread-scheduling overhead - measured consistently *slower* than
-            ``eval_n_jobs=1`` across every thread count from 2 to 128, with
-            both this implementation and a from-scratch ``joblib`` version
-            (an earlier "measured ~1.4x speedup at 8 threads" claim in this
-            docstring did not reproduce under more careful/repeated testing
-            and was retracted - that number should not have been trusted).
-            Threading only has a chance of paying off if a single
-            observable's own NumPy work is heavy enough to dominate GIL
-            overhead - e.g. propagating with little/no ``k1``/``k2``
-            truncation, so individual terms counts run into the thousands+
-            (see :func:`~.utils.make_sparse_evaluator`'s big-``n_terms``
-            timings in ``tests/test_eval_and_grad_jit_bench.py``). For a
-            typical truncated propagation, leave this at ``1``; for genuine
-            multi-core scaling use ``num_jobs`` (separate *processes*, no
-            GIL) for the one-time propagation step, or split work across
-            independent OS processes/SLURM jobs as ``TRAIN.sh`` already does
-            for full training runs.
-
-            Pass ``-1`` to use all available cores (via
-            ``os.sched_getaffinity`` where supported, so this respects a
-            cgroup/SLURM allocation rather than reporting the whole node's
-            core count - see :func:`_available_cpus`; same convention as
-            ``num_jobs`` above) if you want to experiment regardless. The
-            thread pool is created once here and reused for the life of this
-            :class:`Propagator` - ``eval_n_jobs`` cannot be changed without
-            calling :meth:`propagate` again (which isn't supported once
-            already propagated - build a new :class:`Propagator` instead).
-        device : {"cpu", "gpu", "tpu"}, optional
-            Only meaningful for ``backend="vmap"`` - raises :exc:`ValueError`
-            if set for ``"standard"``/``"sparse"`` (they're plain NumPy;
-            there's no device to place them on). Defaults to ``None``, which
-            leaves it to JAX's own default device selection (GPU
-            automatically, if a CUDA-enabled jaxlib/plugin is installed).
-            Pass ``"gpu"`` to opt in explicitly - worthwhile when you're
-            batching many observables together (e.g. MMD-style training),
-            per ``notebooks/test/gpu_backend.ipynb``'s measurements - or
-            ``"cpu"`` to force CPU even if a GPU is present (e.g. to avoid
-            contending for a shared GPU for a workload too small to
-            benefit). Raises :exc:`ValueError` if the requested backend
-            isn't available in this environment.
+            every call to :meth:`__call__`/:meth:`eval_and_grad`. Defaults
+            to ``1`` (sequential Python loop, which is recommended: each
+            observable's evaluation is typically too cheap for threading to
+            pay off). Pass ``-1`` to use all available cores (respecting a
+            cgroup/SLURM allocation via ``os.sched_getaffinity``).
         """
         if self._propagated:
             print("Already propagated")
             return
 
-        if backend not in _BACKENDS:
-            raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
-        if device is not None and backend != "vmap":
-            raise ValueError(
-                f"device={device!r} is only meaningful for backend='vmap' "
-                f"(got backend={backend!r}) - the other backends are plain "
-                "NumPy, there's no device to place them on."
-            )
         if eval_n_jobs == -1:
             eval_n_jobs = _available_cpus()
         elif eval_n_jobs < 1:
             raise ValueError(f"eval_n_jobs must be -1 or a positive integer, got {eval_n_jobs}")
-        if backend == "vmap" and eval_n_jobs > 1:
-            print('backend="vmap" ignores eval_n_jobs (there is no per-observable '
-                  'Python loop left to thread - everything runs in one batched call).')
 
-        builtin_truncations: List[Truncation] = []
-        if self.k1 is not None:
-            builtin_truncations.append(WeightTruncation(self.k1))
-        if self.k2 is not None:
-            builtin_truncations.append(FrequencyTruncation(self.k2))
-        all_truncations = builtin_truncations + list(truncations)
-
-        self.exprs = [None] * len(self.paulidicts)
-        self.history = [None] * len(self.paulidicts)
-
-        if num_jobs == -1:
-            num_jobs = _available_cpus()
-        elif num_jobs < 1:
-            raise ValueError(f"num_jobs must be -1 or a positive integer, got {num_jobs}")
-
-        if num_jobs == 1:
-            for i, paulidict in enumerate(self.paulidicts):
-                if debug:
-                    print("Propagating", paulidict)
-                propagationdicts, propagationexprs, history = heisenberg(
-                    self.gates, paulidict, debug, pruners, all_truncations
+        gate_kind, gate_wire0, gate_wire1, gate_param = [], [], [], []
+        for g in self.gates:
+            name = g.qml_gate.name
+            if name not in _GATE_KIND:
+                raise ValueError(
+                    f"Gate {name!r} has no Rust propagation rule in pprop_rs "
+                    f"(supported: {sorted(_GATE_KIND)})."
                 )
-                self.paulidicts[i], self.exprs[i] = propagationdicts, propagationexprs
-                self.history[i] = history
-        else:
-            worker = partial(
-                _propagate_one,
-                gates=self.gates,
-                debug=debug,
-                pruners=pruners,
-                truncations=all_truncations,
-            )
-            # Platform-default start method ("fork" on Linux): fast, and
-            # fine for the common case (no already-multithreaded library in
-            # this process). NOTE this can deadlock if combined with
-            # backend="vmap" - forking after JAX has started background
-            # threads can inherit a mutex mid-hold by a thread that no
-            # longer exists in the child. Tried switching to "spawn" to
-            # avoid that class of bug; on this codebase's import-heavy
-            # module tree (PennyLane, JAX, ...) that made every num_jobs>1
-            # run - not just backend="vmap" - far slower or apparently hang
-            # (each worker re-imports everything from scratch), so it was
-            # reverted. If you hit the vmap+num_jobs>1 deadlock, the
-            # practical workaround today is num_jobs=1 (propagate
-            # sequentially) when using backend="vmap".
-            with get_context("fork").Pool(num_jobs) as pool:
-                results = pool.map(worker, self.paulidicts)
+            gate_kind.append(_GATE_KIND[name])
+            gate_wire0.append(int(g.wires[0]))
+            gate_wire1.append(int(g.wires[1]) if len(g.wires) > 1 else -1)
+            if g.parameter is None:
+                gate_param.append(-1)
+            elif isinstance(g.parameter, (int, integer)):
+                gate_param.append(int(g.parameter))
+            else:
+                # Fixed-value gate: resolve to its hidden slot (see __init__),
+                # not to int(g.parameter), which would silently truncate the
+                # value and alias it onto an unrelated trainable index.
+                gate_param.append(self._fixed_value_slots[float(g.parameter)])
 
-            for i, (propagationdicts, propagationexprs, history) in enumerate(results):
-                self.paulidicts[i], self.exprs[i] = propagationdicts, propagationexprs
-                self.history[i] = history
+        # pprop_rs packs each Pauli word's x/z plane into a handful of u64
+        # words (see native/pprop_rs/src/lib.rs) rather than one u64, so it
+        # isn't limited to 64 qubits the way a single bitmask would be.
+        # PauliOp.x/.z stay plain (arbitrary-precision) Python ints; only at
+        # this boundary do we chunk them into little-endian u64 limbs.
+        n_words = _words_needed(self.num_qubits)
 
-        self.backend = backend
-        self.device = device
+        rust_paulidicts = []
+        for paulidict in self.paulidicts:
+            spec = []
+            for op, terms in paulidict.items():
+                x_words = _int_to_words(op.x, n_words)
+                z_words = _int_to_words(op.z, n_words)
+                for (c, s, cc) in terms:
+                    spec.append((x_words, z_words, float(c), list(s), list(cc)))
+            rust_paulidicts.append(spec)
+
+        self.exprs = pprop_rs.propagate_batch(
+            self.num_qubits,
+            gate_kind, gate_wire0, gate_wire1, gate_param,
+            self.k1 if self.k1 is not None else -1,
+            self.k2 if self.k2 is not None else -1,
+            coeff_threshold if coeff_threshold is not None else -1.0,
+            use_dead_qubit_pruner, use_xy_weight_pruner,
+            rust_paulidicts,
+        )
+
         self.eval_n_jobs = eval_n_jobs
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._batched_eval: Optional[Callable] = None
-        self._batched_eval_and_grad: Optional[Callable] = None
-        self._raw_eval_and_grad: Optional[Callable] = None
 
-        if backend == "vmap":
-            from .vmap_backend import make_batched_evaluator  # local: defers jax import/config
+        self._eval_list = []
+        self._eval_and_grad_list = []
+        for expr in self.exprs:
+            fg = make_sparse_evaluator(expr, self._internal_num_params)
+            self._eval_list.append(fg[0])
+            self._eval_and_grad_list.append(fg[1])
 
-            self._batched_eval, self._batched_eval_and_grad, self._raw_eval_and_grad = (
-                make_batched_evaluator(self.exprs, self.num_params, device=device)
-            )
-            # Not used by this backend, but kept defined (as empty lists) so any
-            # external code introspecting these attributes doesn't hit AttributeError.
-            self._eval_list = []
-            self._eval_and_grad_list = []
-        else:
-            build_fn = make_evaluator if backend == "standard" else make_sparse_evaluator
-            self._eval_list = []
-            self._eval_and_grad_list = []
-            for expr in self.exprs:
-                fg = build_fn(expr, self.num_params)
-                self._eval_list.append(fg[0])
-                self._eval_and_grad_list.append(fg[1])
-
-            if eval_n_jobs > 1:
-                self._executor = ThreadPoolExecutor(max_workers=eval_n_jobs)
+        if eval_n_jobs > 1:
+            self._executor = ThreadPoolExecutor(max_workers=eval_n_jobs)
 
         self._propagated = True
-        
+
     def show(self) -> None:
         """
         Print an ASCII drawing of the quantum circuit to stdout.
@@ -524,8 +429,12 @@ class Propagator:
         if not expr:
             return S.Zero
 
-        # Create real symbolic angles θ0, θ1, …, θ_{num_params-1}.
-        theta = symbols(f"θ0:{self.num_params}", real=True)
+        # Real trainable indices get a symbolic angle θ0, θ1, …; fixed-value
+        # gates' hidden slots (see __init__) get their literal numeric value
+        # instead, since they aren't free variables of this expression.
+        theta = list(symbols(f"θ0:{self.num_params}", real=True))
+        value_by_slot = {slot: value for value, slot in self._fixed_value_slots.items()}
+        theta += [value_by_slot[i] for i in range(self.num_params, self._internal_num_params)]
 
         terms = []
         for coeff, sin_idx, cos_idx in expr:
@@ -540,8 +449,65 @@ class Propagator:
 
         return Add(*terms)
 
+    def bind(self, exprs: Sequence[Union[Free, float]]) -> BoundPropagator:
+        """
+        Reparametrise this propagator's ``num_params``-sized parameter vector
+        as an affine function of a smaller, user-defined "free" vector, e.g.
+        one gate reading ``f0`` and another reading ``-2 * f0``.
+
+        This needs no support from :meth:`propagate` itself: pprop's own
+        gradient is already exact closed-form calculus, so any affine
+        dependency between gate angles is handled by a single Jacobian
+        multiply, exactly (not approximately), via the chain rule.
+
+        Parameters
+        ----------
+        exprs : sequence of Free or float
+            One entry per index in ``range(num_params)`` (in the same order
+            gates were captured from the ansatz), each either a :class:`Free`
+            expression built from :meth:`Free.vars` via ``+``, ``-``, ``*``,
+            ``/`` with plain numbers, or a plain number for a fixed value at
+            that index.
+
+        Returns
+        -------
+        BoundPropagator
+            Callable wrapper exposing ``__call__(free)`` and
+            ``eval_and_grad(free)`` over the free-parameter vector.
+
+        Examples
+        --------
+        >>> def ansatz(params):
+        ...     qml.RY(params[0], wires=0)   # will represent: f0
+        ...     qml.RX(params[1], wires=1)   # will represent: -2 * f0
+        ...     qml.RZ(params[2], wires=1)   # will represent: f1
+        >>> prop = Propagator(ansatz)
+        >>> prop.propagate()
+        >>> f0, f1 = Free.vars(2)
+        >>> bound = prop.bind([f0, -2 * f0, f1])
+        >>> vals, grad = bound.eval_and_grad(np.array([0.3, 1.1]))
+        """
+        J, b, _ = affine_from_exprs(exprs, self.num_params)
+        return BoundPropagator(self, J, b)
+
+    def _full_params(self, params: ndarray) -> ndarray:
+        """
+        Pad ``params`` (length :attr:`num_params`) with fixed-value gates'
+        hidden slots (length :attr:`_internal_num_params`), so ``sin``/``cos``
+        can be computed once over the full internal parameter vector.
+
+        Passthrough (no allocation) when there are no fixed-value gates.
+        """
+        if not self._fixed_value_slots:
+            return params
+        full = empty(self._internal_num_params)
+        full[: self.num_params] = params
+        for value, slot in self._fixed_value_slots.items():
+            full[slot] = value
+        return full
+
     # --------------- -
-    # Dunder methods 
+    # Dunder methods
     # --------------- -
 
     def __repr__(self) -> str:
@@ -563,9 +529,7 @@ class Propagator:
         """
         Evaluate all observable expectation values at the given parameters.
 
-        Requires :meth:`propagate` to have been called first. Dispatches to
-        whichever ``backend`` was chosen in :meth:`propagate` - the result is
-        identical either way, only the internal computation differs.
+        Requires :meth:`propagate` to have been called first.
 
         Parameters
         ----------
@@ -577,9 +541,8 @@ class Propagator:
         ndarray of shape (num_observables,)
             Expectation value of each observable at ``params``.
         """
-        if self.backend == "vmap":
-            return self._batched_eval(params)
-        sins, coss = sin(params), cos(params)
+        full = self._full_params(params)
+        sins, coss = sin(full), cos(full)
         if self._executor is not None:
             return array(list(self._executor.map(lambda f: f(sins, coss), self._eval_list)))
         return array([f(sins, coss) for f in self._eval_list])
@@ -589,9 +552,7 @@ class Propagator:
         """
         Evaluate expectation values and their parameter gradients simultaneously.
 
-        Requires :meth:`propagate` to have been called first. Dispatches to
-        whichever ``backend`` was chosen in :meth:`propagate` - the result is
-        identical either way, only the internal computation differs.
+        Requires :meth:`propagate` to have been called first.
 
         Parameters
         ----------
@@ -605,10 +566,10 @@ class Propagator:
         grads : ndarray of shape (num_observables, num_params)
             Gradient of each expectation value with respect to each parameter.
         """
-        if self.backend == "vmap":
-            return self._batched_eval_and_grad(params)
+        from numpy import stack
 
-        sins, coss = sin(params), cos(params)
+        full = self._full_params(params)
+        sins, coss = sin(full), cos(full)
         if self._executor is not None:
             results = list(self._executor.map(lambda f: f(sins, coss), self._eval_and_grad_list))
         else:
@@ -616,6 +577,8 @@ class Propagator:
 
         # Unzip the list of (value, gradient) pairs into two separate arrays.
         vals  = array([v for v, _ in results])   # shape: (num_observables,)
-        grads = stack([g for _, g in results])    # shape: (num_observables, num_params)
+        grads = stack([g for _, g in results])    # shape: (num_observables, _internal_num_params)
 
-        return vals, grads
+        # Fixed-value slots aren't trainable, drop their gradient columns so
+        # callers only ever see one column per entry of the params they passed in.
+        return vals, grads[:, : self.num_params]

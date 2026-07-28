@@ -80,20 +80,22 @@ Setting both to ``None`` performs exact propagation with no approximation.
 Step 3: Propagate
 ~~~~~~~~~~~~~~~~~~
 
-``.propagate()`` evolves each observable backwards through the circuit. Each
-line of output shows the initial Pauli word (or linear combination) being
-propagated.
+``.propagate()`` evolves each observable backwards through the circuit, via
+the Rust extension ``pprop_rs`` (see :doc:`/native_pprop_rs`). It runs
+silently and returns nothing; the propagated expressions end up in
+``prop.exprs``.
 
 .. code-block:: python
 
     prop.propagate()
 
-.. code-block:: text
+Two optional exact pruning heuristics can be enabled on top of the
+``k1``/``k2`` cutoffs, which discard terms that provably cannot contribute
+to the final expectation value:
 
-    Propagating (1.0000)*Z0
-    Propagating (1.0000)*X0 X1 X2
-    Propagating (1.0000)*Y2
-    Propagating (-1.0000)*X0 X1 X2 + (13.0000)*Z2
+.. code-block:: python
+
+    prop.propagate(use_dead_qubit_pruner=True, use_xy_weight_pruner=True)
 
 Step 4: Evaluate
 ~~~~~~~~~~~~~~~~~

@@ -2,17 +2,19 @@
 Utility functions for the Propagator class.
 
 Provides:
+
 - :func:`requires_propagation` -- decorator guarding methods until propagation is done.
 - :func:`remove_duplicate_observables` -- deduplicates PennyLane observables by hash.
-- :func:`build_arrays` -- converts :data:`CoeffTerms` into dense NumPy arrays.
-- :func:`make_evaluator` -- compiles :data:`CoeffTerms` into fast numeric callables
-  (``backend="standard"``).
 - :func:`build_sparse_arrays` -- converts :data:`CoeffTerms` into narrow, gathered
   NumPy arrays (no wasted width on untouched parameters).
-- :func:`make_sparse_evaluator` -- like :func:`make_evaluator`, built on the
-  narrow arrays (``backend="sparse"``) - same values/gradients, faster when
-  ``k1``/``k2`` truncation makes each term touch only a small fraction of the
-  circuit's parameters. See ``notebooks/test/sparse_arrays_explained.ipynb``.
+- :func:`make_sparse_evaluator` -- compiles :data:`CoeffTerms` into fast numeric
+  callables built on the narrow arrays. This is the only evaluator this fork
+  keeps. It was measured ~6x faster than the removed dense ("standard")
+  evaluator at typical k1/k2 truncation levels, and the removed JAX/vmap
+  evaluator was consistently slower on CPU (see git history and the paper
+  appendix for the old benchmarks that motivated dropping both). See
+  ``notebooks/test/sparse_arrays_explained.ipynb`` for how the narrow
+  representation works.
 """
 from __future__ import annotations
 
@@ -94,191 +96,6 @@ def remove_duplicate_observables(
             removed_elements.append(simplified)
 
     return unique_observables, removed_elements
-
-def build_arrays(
-    expr: CoeffTerms,
-    num_params: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""
-    Convert a :data:`CoeffTerms` list into dense NumPy arrays for vectorised evaluation.
-
-    Each term in ``expr`` encodes a product of the form:
-
-    .. math::
-
-        c \prod_{i \in \text{sin\_idx}} \sin(\theta_i)
-          \prod_{j \in \text{cos\_idx}} \cos(\theta_j)
-
-    where indices **may repeat**, encoding powers. For example,
-    ``sin_idx = [2, 2, 3]`` encodes :math:`\sin^2(\theta_2)\,\sin(\theta_3)`.
-    The full expression is the sum over all terms:
-
-    .. math::
-
-        f(\boldsymbol{\theta}) = \sum_k c_k
-            \prod_j \sin^{s_{kj}}(\theta_j)
-            \prod_j \cos^{p_{kj}}(\theta_j)
-
-    where :math:`s_{kj}` and :math:`p_{kj}` are the number of times parameter
-    :math:`j` appears in ``sin_idx`` and ``cos_idx`` of term :math:`k`.
-
-    This function unpacks the index lists into integer count arrays of shape
-    ``(n_terms, num_params)`` so that the full expression can be evaluated via
-    ``np.power`` and NumPy broadcasting instead of Python loops.
-
-    Parameters
-    ----------
-    expr : CoeffTerms
-        List of ``(coeff, sin_indices, cos_indices)`` tuples. Indices may repeat.
-    num_params : int
-        Total number of circuit parameters (length of the ``θ`` vector).
-
-    Returns
-    -------
-    coeffs : ndarray of shape (n_terms,), dtype float64
-        Scalar coefficient of each term.
-    sin_counts : ndarray of shape (n_terms, num_params), dtype int32
-        ``sin_counts[i, j]`` is the number of times parameter ``j`` appears in
-        ``sin_idx`` of term ``i``, i.e. the power of :math:`\sin(\theta_j)`.
-    cos_counts : ndarray of shape (n_terms, num_params), dtype int32
-        ``cos_counts[i, j]`` is the number of times parameter ``j`` appears in
-        ``cos_idx`` of term ``i``, i.e. the power of :math:`\cos(\theta_j)`.
-    """
-    n = len(expr)
-    coeffs     = np.zeros(n,             dtype=np.float64)
-    sin_counts = np.zeros((n, num_params), dtype=np.int32)
-    cos_counts = np.zeros((n, num_params), dtype=np.int32)
-
-    for i, (c, sin_idx, cos_idx) in enumerate(expr):
-        coeffs[i] = c
-        for j in sin_idx:
-            sin_counts[i, j] += 1
-        for j in cos_idx:
-            cos_counts[i, j] += 1
-
-    return coeffs, sin_counts, cos_counts
-
-def make_evaluator(
-    expr: CoeffTerms,
-    num_params: int,
-) -> Tuple[Callable[[np.ndarray, np.ndarray], float],
-           Callable[[np.ndarray, np.ndarray], Tuple[float, np.ndarray]]]:
-    """
-    Compile a :data:`CoeffTerms` expression into fast numeric callables.
-
-    Calls :func:`build_arrays` once to pre-compute the coefficient vector and
-    integer count arrays, then closes over them in two inner functions that can
-    be called repeatedly with different parameter vectors without rebuilding the
-    arrays.
-
-    The returned callables take ``sin(theta)``/``cos(theta)`` themselves,
-    already computed, rather than ``theta`` - :meth:`Propagator.__call__` and
-    :meth:`Propagator.eval_and_grad` compute those once per call and share
-    them across every observable's callable, instead of every observable
-    redundantly recomputing ``sin``/``cos`` of the same ``theta``.
-
-    Parameters
-    ----------
-    expr : CoeffTerms
-        Symbolic expression as a list of ``(coeff, sin_indices, cos_indices)``
-        tuples. Indices may repeat to encode powers.
-    num_params : int
-        Total number of circuit parameters.
-
-    Returns
-    -------
-    eval : Callable[[ndarray, ndarray], float]
-        ``eval(sins, coss)`` returns the scalar expectation value, where
-        ``sins = sin(theta)`` and ``coss = cos(theta)``.
-    eval_grad : Callable[[ndarray, ndarray], Tuple[float, ndarray]]
-        ``eval_grad(sins, coss)`` returns ``(value, gradient)`` where
-        ``gradient`` has shape ``(num_params,)``.
-
-    Notes
-    -----
-    Each term evaluates to:
-
-    .. math::
-
-        t_k(\\boldsymbol{\\theta}) = c_k
-            \\prod_j \\sin^{s_{kj}}(\\theta_j)
-            \\prod_j \\cos^{p_{kj}}(\\theta_j)
-
-    The gradient with respect to :math:`\\theta_j` follows from the chain rule:
-
-    .. math::
-
-        \\frac{\\partial t_k}{\\partial \\theta_j} =
-            c_k \\, s_{kj} \\sin^{s_{kj}-1}(\\theta_j) \\cos(\\theta_j)
-            \\prod_{l \\neq j} \\sin^{s_{kl}}(\\theta_l)
-            \\prod_l \\cos^{p_{kl}}(\\theta_l)
-            - c_k \\, p_{kj} \\cos^{p_{kj}-1}(\\theta_j) \\sin(\\theta_j)
-            \\prod_l \\sin^{s_{kl}}(\\theta_l)
-            \\prod_{l \\neq j} \\cos^{p_{kl}}(\\theta_l)
-
-    Computed via prefix/suffix cumulative products to avoid any division.
-    """
-    # Pre-build dense arrays once; subsequent calls reuse them.
-    coeffs, sin_counts, cos_counts = build_arrays(expr, num_params)
-
-    def _eval(sins: np.ndarray, coss: np.ndarray) -> float:
-        """Evaluate the expectation value given ``sin(theta)``/``cos(theta)``."""
-        # Raise each sin/cos value to the per-term power given by the count
-        # arrays, then take the product over parameters for each term.
-        # A count of 0 gives sin⁰ = 1, handled naturally by **0.
-        sin_prods = np.prod(sins[None, :] ** sin_counts, axis=1)  # (n_terms,)
-        cos_prods = np.prod(coss[None, :] ** cos_counts, axis=1)  # (n_terms,)
-
-        return float((coeffs * sin_prods * cos_prods).sum())
-
-    def _eval_grad(sins: np.ndarray, coss: np.ndarray) -> Tuple[float, np.ndarray]:
-        """Evaluate the expectation value and its gradient given
-        ``sin(theta)``/``cos(theta)``."""
-        sins_pow = sins[None, :] ** sin_counts  # (n_terms, num_params)
-        coss_pow = coss[None, :] ** cos_counts  # (n_terms, num_params)
-
-        sin_prods = sins_pow.prod(axis=1)        # (n_terms,)
-        cos_prods = coss_pow.prod(axis=1)        # (n_terms,)
-        term_vals = coeffs * sin_prods * cos_prods
-
-        n_terms = len(coeffs)
-
-        # Prefix/suffix cumulative products so we can form the product of all
-        # sin (or cos) factors *excluding* the j-th one without any division.
-        #   left[i, j]  = prod_{l < j} sins_pow[i, l]
-        #   right[i, j] = prod_{l > j} sins_pow[i, l]
-        left_sin  = np.cumprod(np.concatenate([np.ones((n_terms, 1)), sins_pow[:, :-1]], axis=1), axis=1)
-        right_sin = np.cumprod(np.concatenate([sins_pow[:, 1:], np.ones((n_terms, 1))], axis=1)[:, ::-1], axis=1)[:, ::-1]
-        excl_sin  = left_sin * right_sin  # (n_terms, num_params)
-
-        left_cos  = np.cumprod(np.concatenate([np.ones((n_terms, 1)), coss_pow[:, :-1]], axis=1), axis=1)
-        right_cos = np.cumprod(np.concatenate([coss_pow[:, 1:], np.ones((n_terms, 1))], axis=1)[:, ::-1], axis=1)[:, ::-1]
-        excl_cos  = left_cos * right_cos  # (n_terms, num_params)
-
-        # d/dtheta_j [sin(theta_j)^s] = s * sin(theta_j)^(s-1) * cos(theta_j)
-        # np.maximum avoids a negative exponent when s=0; np.where zeros that branch out.
-        d_sin = np.where(
-            sin_counts > 0,
-            sin_counts * sins[None, :] ** np.maximum(sin_counts - 1, 0) * coss[None, :],
-            0.0,
-        )  # (n_terms, num_params)
-
-        # d/dtheta_j [cos(theta_j)^p] = -p * cos(theta_j)^(p-1) * sin(theta_j)
-        d_cos = np.where(
-            cos_counts > 0,
-            -cos_counts * coss[None, :] ** np.maximum(cos_counts - 1, 0) * sins[None, :],
-            0.0,
-        )  # (n_terms, num_params)
-
-        sin_grad = coeffs[:, None] * d_sin * excl_sin * cos_prods[:, None]   # (n_terms, num_params)
-        cos_grad = coeffs[:, None] * sin_prods[:, None] * excl_cos * d_cos   # (n_terms, num_params)
-
-        grad = (sin_grad + cos_grad).sum(axis=0)  # (num_params,)
-
-        return float(term_vals.sum()), grad
-
-    return _eval, _eval_grad
-
 
 def build_sparse_arrays(
     expr: CoeffTerms,

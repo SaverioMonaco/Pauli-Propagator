@@ -1,7 +1,7 @@
-pprop.propagator.pruning module
+pprop.propagator.binding module
 ===============================
 
-.. automodule:: pprop.propagator.pruning
+.. automodule:: pprop.propagator.binding
    :members:
    :show-inheritance:
    :undoc-members:

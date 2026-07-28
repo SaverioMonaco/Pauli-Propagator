@@ -5,7 +5,6 @@ import pennylane as qml
 from numpy import mean, std
 
 from pprop import Propagator
-from pprop.propagator.pruning import DeadQubitPruner, XYWeightPruner
 
 num_qubits = 6
 num_iterations = 20
@@ -27,13 +26,13 @@ time_opt = []
 time_no_opt = []
 # %%
 for i in range(num_iterations):
-    for pruner in [[], [DeadQubitPruner(), XYWeightPruner()], [XYWeightPruner()], [DeadQubitPruner()]]:
+    for use_dead, use_xy in [(False, False), (True, True), (False, True), (True, False)]:
         prop = Propagator(ansatz)
         time_start = time.time()
-        prop.propagate(pruners=pruner)
+        prop.propagate(use_dead_qubit_pruner=use_dead, use_xy_weight_pruner=use_xy)
         time_stop = time.time()
 
-        if pruner:
+        if use_dead or use_xy:
             time_opt.append(time_stop - time_start)
         else:
             time_no_opt.append(time_stop - time_start)

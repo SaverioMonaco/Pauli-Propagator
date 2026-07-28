@@ -25,3 +25,4 @@ Pauli-Propagator
    :caption: Documentation
 
    pprop
+   native_pprop_rs

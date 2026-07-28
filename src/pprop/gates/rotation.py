@@ -2,16 +2,18 @@
 This submodule defines :class:`RotationGate`, the base class for single-qubit
 parametrised Pauli rotation gates, and the concrete gates :class:`RX`,
 :class:`RY`, and :class:`RZ`.
+
+The ``rule`` tables below are the human-readable reference for these gates'
+Heisenberg evolution; the Rust extension ``pprop_rs`` (``rx_rule``/``ry_rule``/
+``rz_rule`` in ``native/pprop_rs/src/lib.rs``) is what actually executes them
+during :meth:`~pprop.propagator.Propagator.propagate`.
 """
 from typing import Dict, List, Tuple
 
-from numpy import cos, integer, intp, sin
 from pennylane import RX as qmlRX
 from pennylane import RY as qmlRY
 from pennylane import RZ as qmlRZ
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 from .base import Gate
 
 # Rule type: maps a single-qubit Pauli label to (output_label, sign).
@@ -70,73 +72,6 @@ class RotationGate(Gate):
     ) -> None:
         super().__init__(wires=wires, qml_gate=qml_gate, parameter=parameter)
         self.rule = rule
-
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this rotation gate.
-
-        For a Pauli :math:`Q` that anti-commutes with the rotation axis, the
-        evolution produces two branches:
-
-        .. math::
-
-            Q \\;\\mapsto\\; \\cos(\\theta)\\, Q \\;+\\; \\sigma\\sin(\\theta)\\, Q'
-
-        Each branch is implemented by appending the gate's ``parameter``
-        to the ``cos_idx`` (cosine branch, same Pauli) or ``sin_idx`` (sine
-        branch, new Pauli) of every existing :data:`CoeffTerm`.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair to evolve.
-
-        Returns
-        -------
-        PauliDict
-            One entry if the word commutes with the gate; two entries
-            (cos and sin branches) otherwise.
-        """
-        op, coeff_terms = word
-        wire  = self.wires[0]
-        pauli = op[wire]
-        rule  = self.rule.get(pauli, None)
-
-        # If no rule exists this Pauli commutes with the gate, pass through unchanged.
-        if rule is None:
-            return PauliDict({op: coeff_terms})
-
-        output_label, sign = rule
-
-        new_op = op.copy()
-        new_op.set(wire, output_label)
-
-        if isinstance(self.parameter, (integer, intp)):
-            # Cosine branch: original Pauli survives, each term gains a cos(θ) factor.
-            cos_terms: CoeffTerms = [
-                (c, list(s), list(cc) + [self.parameter])
-                for c, s, cc in coeff_terms
-            ]
-
-            # Sine branch: new Pauli appears, each term gains a sign * sin(θ) factor.
-            sin_terms: CoeffTerms = [
-                (sign * c, list(s) + [self.parameter], list(cc))
-                for c, s, cc in coeff_terms
-            ]
-        else:
-            # Cosine branch: original Pauli survives, each term gains a cos(θ) factor.
-            cos_terms: CoeffTerms = [
-                (c * cos(self.parameter), list(s), list(cc))
-                for c, s, cc in coeff_terms
-            ]
-
-            # Sine branch: new Pauli appears, each term gains a sign * sin(θ) factor.
-            sin_terms: CoeffTerms = [
-                (sign * c * sin(self.parameter), list(s), list(cc))
-                for c, s, cc in coeff_terms
-            ]
-
-        return PauliDict({op: cos_terms, new_op: sin_terms})
 
 
 class RX(RotationGate):

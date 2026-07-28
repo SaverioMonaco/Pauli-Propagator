@@ -1,26 +1,32 @@
 """
-This module defines :class:`Gate`, the abstract base class for all quantum gates
-in the Pauli propagation framework.
+This module defines :class:`Gate`, the base class for all quantum gates in
+the Pauli propagation framework.
+
+Each concrete gate subclass (see ``pprop/gates/*.py``) still declares its
+Heisenberg evolution ``rule`` table as the human-readable reference/spec.
+``tests/test_backends.py`` checks the Rust extension ``pprop_rs`` against
+PennyLane directly on full random circuits; ``tests/test_rule_tables.py``
+checks each gate's ``rule`` dict here against its Rust counterpart
+(``native/pprop_rs/src/lib.rs``) entry-for-entry, via the
+``evolve_single_gate_debug`` debug hook, so the two can't silently drift
+apart. Actually *executing* that evolution happens only in Rust; ``Gate``
+itself carries no ``evolve()`` method.
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from numpy import integer, intp
 from pennylane.operation import Operation
 
-from ..pauli.op import PauliOp
-from ..pauli.sentence import CoeffTerms, PauliDict
 
-
-class Gate(ABC):
+class Gate:
     """
-    Abstract base class for all quantum gates.
+    Base class for all quantum gates.
 
     Each concrete gate subclass stores a PennyLane operator instance for
-    circuit drawing and a Heisenberg evolution rule used during Pauli
-    propagation. The constructor validates that the number of wires and
+    circuit drawing and metadata (wires, parameter index) used to build the
+    gate list :meth:`~pprop.propagator.Propagator.propagate` hands to the
+    Rust extension. The constructor validates that the number of wires and
     the presence or absence of a parameter are consistent with the
     PennyLane gate's expectations.
 
@@ -75,10 +81,6 @@ class Gate(ABC):
         )
         self.wires = wires
         self.parameter = parameter
-        # Bitmask of `wires`, cached once so heisenberg() can cheaply test a
-        # gate for overlap against a PauliDict's active-qubit mask without
-        # recomputing `sum(1 << w for w in wires)` on every propagation step.
-        self.wire_mask = sum(1 << w for w in wires)
 
         # ------------------------------------------------------------------ #
         # Validation                                                           #
@@ -114,42 +116,3 @@ class Gate(ABC):
                 f"{self.qml_gate.name} does not accept parameters, "
                 f"but parameter_index={parameter} was given."
             )
-
-    @abstractmethod
-    def evolve(self, word: Tuple[PauliOp, CoeffTerms]) -> PauliDict:
-        """
-        Heisenberg-evolve a Pauli word through this gate.
-
-        Computes :math:`G^\\dagger\\, P\\, G` for the Pauli word :math:`P`
-        encoded in ``word``, where :math:`G` is this gate. The result is
-        returned as a :class:`~pprop.pauli.sentence.PauliDict` mapping each
-        output Pauli word to its updated :data:`~pprop.pauli.sentence.CoeffTerms`.
-
-        Parameters
-        ----------
-        word : tuple[PauliOp, CoeffTerms]
-            ``(pauliop, coeff_terms)`` pair representing the Pauli word to evolve
-            and its current symbolic coefficient.
-
-        Returns
-        -------
-        PauliDict
-            The evolved Pauli word(s) with updated coefficients.
-        """
-
-    def __repr__(self) -> str:
-        """
-        Return a concise string representation of the gate.
-
-        Returns
-        -------
-        str
-            ``"GateName([wires])"`` for non-parametrised gates, or
-            ``"GateName(θ_i, [wires])"`` for parametrised gates.
-        """
-        if self.parameter is None:
-            return f"{self.qml_gate.name}({self.wires})"
-        elif isinstance(self.parameter, (integer, intp)):
-            return f"{self.qml_gate.name}({self.parameter}, {self.wires})"
-        else:
-            return f"{self.qml_gate.name}(θ_{self.parameter}, {self.wires})"
