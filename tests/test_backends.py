@@ -15,6 +15,7 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
+from pprop.propagator.utils import build_sparse_arrays
 
 num_qubits = 3
 
@@ -292,6 +293,108 @@ def test_propagator_beyond_64_qubits():
         )
 
 
+def _live_slots(arrays):
+    """Slots still referenced by a nonzero-power factor (padding carries power 0)."""
+    _, idx_sin, pow_sin, idx_cos, pow_cos = arrays
+    return set(idx_sin[pow_sin > 0].tolist()) | set(idx_cos[pow_cos > 0].tolist())
+
+
+def _live_cells(arrays):
+    """Total sin/cos factors actually gathered per call."""
+    return int((arrays[2] > 0).sum() + (arrays[4] > 0).sum())
+
+
+def test_fixed_value_gates_are_constant_folded():
+    """
+    A fixed-value gate contributes a constant sin/cos factor, so it can be
+    folded into the coefficients at build time rather than re-evaluated on
+    every call. Terms carrying a sin(pi) factor are identically zero for every
+    parameter vector and disappear altogether - modulo the ~1e-16 that
+    np.sin(np.pi) actually returns, which is what the snap tolerance handles.
+    """
+    def ansatz(params):
+        for q in range(num_qubits):
+            qml.RX(params[q], wires=q)
+        qml.CNOT(wires=[0, 1])
+        qml.CNOT(wires=[1, 2])
+        qml.RY(np.pi, wires=0)          # fixed, not trainable
+        for q in range(num_qubits):
+            qml.RY(params[num_qubits + q], wires=q)
+        return qml.expval(qml.PauliZ(0) @ qml.PauliZ(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    assert prop._fixed_value_slots, "expected RY(pi) to get a fixed slot"
+
+    expr = prop.exprs[0]
+    n_internal = prop._internal_num_params
+    fixed_slots = set(prop._fixed_value_slots.values())
+    unfolded = build_sparse_arrays(expr, n_internal)
+    folded = build_sparse_arrays(expr, n_internal, prop._value_by_slot())
+
+    # The invariant folding buys us isn't "fewer terms" (that only happens for
+    # the angles whose sin or cos is zero) but "the fixed slots are gone": no
+    # surviving factor may still reference one.
+    assert fixed_slots <= _live_slots(unfolded), "test is vacuous: nothing to fold"
+    assert not (fixed_slots & _live_slots(folded)), (
+        f"fixed slots {sorted(fixed_slots & _live_slots(folded))} survived folding"
+    )
+
+    # and the answer is unchanged
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
+    for _ in range(3):
+        params = qml.numpy.random.uniform(-np.pi, np.pi, prop.num_params)
+        val, grad = prop.eval_and_grad(params)
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+
+
+def test_fixed_value_gates_off_the_quarter_turn_grid_are_folded():
+    """
+    Sibling of test_fixed_value_gates_are_constant_folded for a fixed angle
+    that is *not* a multiple of pi/2: sin(0.3) and cos(0.3) are both nonzero,
+    so nothing gets snapped to zero and no term is killed. Instead every term
+    is rescaled and loses the fixed slot from its sin/cos support - the
+    rescale-and-shrink path rather than the drop path.
+    """
+    def ansatz(params):
+        for q in range(num_qubits):
+            qml.RX(params[q], wires=q)
+        qml.CNOT(wires=[0, 1])
+        qml.CNOT(wires=[1, 2])
+        qml.RY(0.3, wires=0)            # fixed, not trainable, not a quarter turn
+        for q in range(num_qubits):
+            qml.RY(params[num_qubits + q], wires=q)
+        return qml.expval(qml.PauliZ(0) @ qml.PauliZ(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    assert prop._fixed_value_slots, "expected RY(0.3) to get a fixed slot"
+
+    expr = prop.exprs[0]
+    n_internal = prop._internal_num_params
+    fixed_slots = set(prop._fixed_value_slots.values())
+    unfolded = build_sparse_arrays(expr, n_internal)
+    folded = build_sparse_arrays(expr, n_internal, prop._value_by_slot())
+
+    # Generic angle: sin(0.3) and cos(0.3) are both nonzero, so no term dies.
+    # Array *widths* are a global max over terms and can stay flat even when
+    # every single term shrank, so count the live gather cells instead.
+    assert len(folded[0]) == len(unfolded[0]), "no term should be dropped for a generic angle"
+    assert not np.allclose(folded[0], unfolded[0]), "coefficients should have been rescaled"
+    assert fixed_slots <= _live_slots(unfolded), "test is vacuous: nothing to fold"
+    assert not (fixed_slots & _live_slots(folded)), "fixed slot survived folding"
+    assert _live_cells(folded) < _live_cells(unfolded), "fewer factors to gather per call"
+
+    # and the answer is unchanged
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
+    for _ in range(3):
+        params = qml.numpy.random.uniform(-np.pi, np.pi, prop.num_params)
+        val, grad = prop.eval_and_grad(params)
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+
+
 # %%
 test_propagator_agrees_with_qml()
 test_eval_n_jobs_matches_single_threaded()
@@ -299,3 +402,5 @@ test_fixed_value_parameter_is_not_aliased()
 test_controlled_rotations_agree_with_qml()
 test_bind_affine_reparametrisation_agrees_with_qml()
 test_propagator_beyond_64_qubits()
+test_fixed_value_gates_are_constant_folded()
+test_fixed_value_gates_off_the_quarter_turn_grid_are_folded()

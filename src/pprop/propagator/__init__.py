@@ -374,10 +374,14 @@ class Propagator:
         self.eval_n_jobs = eval_n_jobs
         self._executor: Optional[ThreadPoolExecutor] = None
 
+        fixed_angles = self._value_by_slot()
         self._eval_list = []
         self._eval_and_grad_list = []
         for expr in self.exprs:
-            fg = make_sparse_evaluator(expr, self._internal_num_params)
+            fg = make_sparse_evaluator(
+                expr, self._internal_num_params,
+                fixed_angles=fixed_angles,
+            )
             self._eval_list.append(fg[0])
             self._eval_and_grad_list.append(fg[1])
 
@@ -433,7 +437,7 @@ class Propagator:
         # gates' hidden slots (see __init__) get their literal numeric value
         # instead, since they aren't free variables of this expression.
         theta = list(symbols(f"θ0:{self.num_params}", real=True))
-        value_by_slot = {slot: value for value, slot in self._fixed_value_slots.items()}
+        value_by_slot = self._value_by_slot()
         theta += [value_by_slot[i] for i in range(self.num_params, self._internal_num_params)]
 
         terms = []
@@ -489,6 +493,17 @@ class Propagator:
         """
         J, b, _ = affine_from_exprs(exprs, self.num_params)
         return BoundPropagator(self, J, b)
+
+    def _value_by_slot(self) -> dict:
+        """
+        Invert :attr:`_fixed_value_slots` into ``{slot: value}``.
+
+        :meth:`__init__` builds the value-keyed direction because it dedupes
+        fixed values by value, but every consumer (the evaluator's constant
+        folding, :meth:`expression`'s symbol table) wants slot -> value. This
+        is the single place that inversion happens.
+        """
+        return {slot: value for value, slot in self._fixed_value_slots.items()}
 
     def _full_params(self, params: ndarray) -> ndarray:
         """
