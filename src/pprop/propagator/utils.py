@@ -233,14 +233,20 @@ def make_sparse_evaluator(
         excl_sin, excl_cos = excl(sin_pow), excl(cos_pow)
         cos_at_sin, sin_at_cos = coss[idx_sin], sins[idx_cos]  # gather, not a fresh cos/sin call
 
+        # Clamp the exponent rather than testing the base. Padding entries carry
+        # pow == 0 and would otherwise evaluate x ** -1; clamping to >= 0 avoids
+        # that just as well, and keeps 0.0 ** 0 == 1.0 -- which is the correct
+        # factor for a power-1 term sitting at exactly sin(theta) == 0, where
+        # the previous `sin_g != 0` guard returned 0.0 and zeroed a gradient
+        # component that is not zero.
         d_sin = np.where(
             pow_sin > 0,
-            pow_sin * np.where(sin_g != 0, sin_g ** (pow_sin - 1), 0.0) * cos_at_sin,
+            pow_sin * sin_g ** np.maximum(pow_sin - 1.0, 0.0) * cos_at_sin,
             0.0,
         )
         d_cos = np.where(
             pow_cos > 0,
-            -pow_cos * np.where(cos_g != 0, cos_g ** (pow_cos - 1), 0.0) * sin_at_cos,
+            -pow_cos * cos_g ** np.maximum(pow_cos - 1.0, 0.0) * sin_at_cos,
             0.0,
         )
 
