@@ -97,9 +97,16 @@ def remove_duplicate_observables(
 
     return unique_observables, removed_elements
 
+#: A folded constant this close to zero is snapped to a true zero, so that a
+#: factor of e.g. ``sin(pi)`` kills its term instead of leaving the ~1e-16 float
+#: residue behind.
+_FOLD_SNAP = 1e-12
+
+
 def build_sparse_arrays(
     expr: CoeffTerms,
     num_params: int,
+    fixed_value_slots: dict | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     r"""
     Convert a :data:`CoeffTerms` list into narrow, gathered NumPy arrays.
@@ -127,6 +134,12 @@ def build_sparse_arrays(
         Total number of circuit parameters (only used to size the fallback
         ``coeffs``-only case; the returned arrays never have a ``num_params``-sized
         axis).
+    fixed_value_slots : dict, optional
+        ``{angle: slot}`` for gates whose angle is fixed, i.e. a
+        :class:`~pprop.propagator.Propagator`'s ``_fixed_value_slots``. Those
+        angles are constants, so their sin/cos is folded into the coefficients
+        here and the slot is dropped from the term. Terms whose coefficient
+        becomes zero are dropped outright. ``None`` folds nothing.
 
     Returns
     -------
@@ -140,8 +153,36 @@ def build_sparse_arrays(
     idx_cos, pow_cos : ndarray
         As ``idx_sin``/``pow_sin``, for the cosine factors.
     """
+    # sin/cos of a fixed angle is a compile-time constant, so fold it into the
+    # term's coefficient here instead of re-evaluating it on every call. Snap
+    # near-zero constants to a true zero: np.sin(np.pi) is 1.22e-16, not 0.0,
+    # and without the snap a term that should vanish survives carrying noise.
+    fixed_sin, fixed_cos = {}, {}
+    for value, slot in (fixed_value_slots or {}).items():
+        s, c = float(np.sin(value)), float(np.cos(value))
+        fixed_sin[slot] = 0.0 if abs(s) < _FOLD_SNAP else s
+        fixed_cos[slot] = 0.0 if abs(c) < _FOLD_SNAP else c
+
     packed = []
     for coeff, sin_idx, cos_idx in expr:
+        if fixed_sin:
+            kept_sin = []
+            for j in sin_idx:
+                if j in fixed_sin:
+                    coeff *= fixed_sin[j]
+                else:
+                    kept_sin.append(j)
+            if coeff == 0.0:
+                continue  # identically zero for every theta, e.g. a sin(pi) factor
+            kept_cos = []
+            for j in cos_idx:
+                if j in fixed_cos:
+                    coeff *= fixed_cos[j]
+                else:
+                    kept_cos.append(j)
+            if coeff == 0.0:
+                continue
+            sin_idx, cos_idx = kept_sin, kept_cos
         packed.append((coeff, list(Counter(sin_idx).items()), list(Counter(cos_idx).items())))
 
     n = len(packed)
@@ -167,6 +208,7 @@ def build_sparse_arrays(
 def make_sparse_evaluator(
     expr: CoeffTerms,
     num_params: int,
+    fixed_value_slots: dict | None = None,
 ) -> Tuple[Callable[[np.ndarray, np.ndarray], float],
            Callable[[np.ndarray, np.ndarray], Tuple[float, np.ndarray]]]:
     """
@@ -199,13 +241,17 @@ def make_sparse_evaluator(
         tuples. Indices may repeat to encode powers.
     num_params : int
         Total number of circuit parameters.
+    fixed_value_slots : dict, optional
+        Passed through to :func:`build_sparse_arrays`; see there. Defaults to
+        ``None`` (no folding).
 
     Returns
     -------
     eval : Callable[[ndarray, ndarray], float]
     eval_grad : Callable[[ndarray, ndarray], Tuple[float, ndarray]]
     """
-    coeffs, idx_sin, pow_sin, idx_cos, pow_cos = build_sparse_arrays(expr, num_params)
+    coeffs, idx_sin, pow_sin, idx_cos, pow_cos = build_sparse_arrays(
+        expr, num_params, fixed_value_slots)
 
     def _eval(sins: np.ndarray, coss: np.ndarray) -> float:
         sin_g = sins[idx_sin]  # gather: (n_terms, Ws)

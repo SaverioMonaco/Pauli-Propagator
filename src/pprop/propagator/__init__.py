@@ -377,7 +377,10 @@ class Propagator:
         self._eval_list = []
         self._eval_and_grad_list = []
         for expr in self.exprs:
-            fg = make_sparse_evaluator(expr, self._internal_num_params)
+            fg = make_sparse_evaluator(
+                expr, self._internal_num_params,
+                fixed_value_slots=self._fixed_value_slots,
+            )
             self._eval_list.append(fg[0])
             self._eval_and_grad_list.append(fg[1])
 

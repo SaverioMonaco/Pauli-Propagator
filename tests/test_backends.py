@@ -15,6 +15,7 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
+from pprop.propagator.utils import build_sparse_arrays
 
 num_qubits = 3
 
@@ -292,6 +293,43 @@ def test_propagator_beyond_64_qubits():
         )
 
 
+def test_fixed_value_gates_are_constant_folded():
+    """
+    A fixed-value gate contributes a constant sin/cos factor, so it can be
+    folded into the coefficients at build time rather than re-evaluated on
+    every call. Terms carrying a sin(pi) factor are identically zero for every
+    parameter vector and disappear altogether - modulo the ~1e-16 that
+    np.sin(np.pi) actually returns, which is what the snap tolerance handles.
+    """
+    def ansatz(params):
+        for q in range(num_qubits):
+            qml.RX(params[q], wires=q)
+        qml.CNOT(wires=[0, 1])
+        qml.CNOT(wires=[1, 2])
+        qml.RY(np.pi, wires=0)          # fixed, not trainable
+        for q in range(num_qubits):
+            qml.RY(params[num_qubits + q], wires=q)
+        return qml.expval(qml.PauliZ(0) @ qml.PauliZ(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    assert prop._fixed_value_slots, "expected RY(pi) to get a fixed slot"
+
+    expr = prop.exprs[0]
+    n_internal = prop._internal_num_params
+    unfolded = build_sparse_arrays(expr, n_internal)[0]
+    folded = build_sparse_arrays(expr, n_internal, prop._fixed_value_slots)[0]
+    assert len(folded) < len(unfolded), "sin(pi) terms should have been dropped"
+
+    # and the answer is unchanged
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
+    for _ in range(3):
+        params = qml.numpy.random.uniform(-np.pi, np.pi, prop.num_params)
+        val, grad = prop.eval_and_grad(params)
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+
+
 # %%
 test_propagator_agrees_with_qml()
 test_eval_n_jobs_matches_single_threaded()
@@ -299,3 +337,4 @@ test_fixed_value_parameter_is_not_aliased()
 test_controlled_rotations_agree_with_qml()
 test_bind_affine_reparametrisation_agrees_with_qml()
 test_propagator_beyond_64_qubits()
+test_fixed_value_gates_are_constant_folded()
