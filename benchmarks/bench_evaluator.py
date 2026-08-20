@@ -123,8 +123,8 @@ def main() -> None:
     p.add_argument("--side", type=int, default=6)
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--repeats", type=int, default=15)
-    p.add_argument("--baseline", default="main",
-                   help="git ref to compare against (default: main)")
+    p.add_argument("--baseline", default="0511b27",
+                   help="git ref to compare against (default: 0511b27)")
     a = p.parse_args()
 
     print(f"{a.side}x{a.side} transverse-field Ising, {a.layers} brick layers")
