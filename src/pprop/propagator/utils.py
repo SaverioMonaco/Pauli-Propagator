@@ -6,8 +6,8 @@ Provides:
 - :func:`requires_propagation` -- decorator guarding methods until propagation is done.
 - :func:`remove_duplicate_observables` -- deduplicates PennyLane observables by hash.
 
-The evaluator-building functions (``build_sparse_arrays``, ``build_ragged_arrays``,
-``make_sparse_evaluator``) live in :mod:`pprop.propagator.evaluator`.
+The evaluator-building functions (``build_ragged_arrays``, ``make_sparse_evaluator``)
+live in :mod:`pprop.propagator.evaluator`.
 """
 from __future__ import annotations
 

@@ -3,94 +3,27 @@ Compiles :data:`CoeffTerms` expressions into fast numeric evaluators.
 
 Provides:
 
-- :func:`build_sparse_arrays` -- converts :data:`CoeffTerms` into narrow, gathered
-  NumPy arrays (no wasted width on untouched parameters). See
-  ``notebooks/test/sparse_arrays_explained.ipynb`` for how the narrow
-  representation works.
-- :func:`build_ragged_arrays` -- the same idea without the padding: sin and cos
-  factors in one concatenated list, indexed against a single lookup table.
+- :func:`build_ragged_arrays` -- converts :data:`CoeffTerms` into a ragged
+  (CSR-style) layout: sin and cos factors in one concatenated list, indexed
+  against a single lookup table, with no padding.
 - :func:`make_sparse_evaluator` -- compiles :data:`CoeffTerms` into fast numeric
   callables built on the ragged arrays. This is the only evaluator
   this fork keeps. It was measured ~6x faster than the removed dense
   ("standard") evaluator at typical k1/k2 truncation levels, and the removed
   JAX/vmap evaluator was consistently slower on CPU (see git history and the
-  paper appendix for the old benchmarks that motivated dropping both).
+  paper appendix for the old benchmarks that motivated dropping both). The
+  padded/gathered layout this replaced (``build_sparse_arrays``) lives on in
+  ``tests/legacy_sparse_arrays.py``, kept only so the test suite can still
+  cross-check the ragged evaluator against it - it is not part of the public
+  API anymore.
 """
 from __future__ import annotations
 
-from collections import Counter
 from typing import Callable, Tuple
 
 import numpy as np
 
 from ..pauli.sentence import CoeffTerms
-
-
-def build_sparse_arrays(
-    expr: CoeffTerms,
-    num_params: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    r"""
-    Convert a :data:`CoeffTerms` list into narrow, gathered NumPy arrays.
-
-    Like :func:`build_arrays`, but instead of a full ``(n_terms, num_params)``
-    row per term (mostly filled with the trivial power ``0``), only the
-    parameters a term actually touches are stored, padded to a common width
-    ``W`` = the largest number of distinct parameters touched by any single
-    term in ``expr``. ``k1`` (Pauli weight truncation) bounds ``W`` directly,
-    so ``W`` is typically far smaller than ``num_params`` for a heavily
-    truncated propagation - evaluating the resulting arrays does the same
-    computation as :func:`build_arrays`' output with much less wasted work
-    (see ``notebooks/test/sparse_arrays_explained.ipynb`` for a worked example
-    and measurements).
-
-    Sin and cos are tracked with independent widths (``Ws``, ``Wc``), since a
-    term's sine and cosine supports need not be the same size.
-
-    Parameters
-    ----------
-    expr : CoeffTerms
-        List of ``(coeff, sin_indices, cos_indices)`` tuples. Indices may repeat
-        (encoding powers > 1).
-    num_params : int
-        Total number of circuit parameters (only used to size the fallback
-        ``coeffs``-only case; the returned arrays never have a ``num_params``-sized
-        axis).
-
-    Returns
-    -------
-    coeffs : ndarray of shape (n_terms,), dtype float64
-    idx_sin : ndarray of shape (n_terms, Ws), dtype int64
-        Parameter index touched by each sin factor; padding entries are ``0``.
-    pow_sin : ndarray of shape (n_terms, Ws), dtype float64
-        Power of that sin factor; padding entries are ``0`` (making the padded
-        factor ``sin(theta)**0 = 1``, a no-op, regardless of ``idx_sin``'s
-        padding value).
-    idx_cos, pow_cos : ndarray
-        As ``idx_sin``/``pow_sin``, for the cosine factors.
-    """
-    packed = []
-    for coeff, sin_idx, cos_idx in expr:
-        packed.append((coeff, list(Counter(sin_idx).items()), list(Counter(cos_idx).items())))
-
-    n = len(packed)
-    Ws = max((len(s) for _, s, _ in packed), default=1) or 1
-    Wc = max((len(c) for _, _, c in packed), default=1) or 1
-
-    coeffs = np.zeros(n, dtype=np.float64)
-    idx_sin = np.zeros((n, Ws), dtype=np.int64)
-    pow_sin = np.zeros((n, Ws), dtype=np.float64)
-    idx_cos = np.zeros((n, Wc), dtype=np.int64)
-    pow_cos = np.zeros((n, Wc), dtype=np.float64)
-
-    for i, (coeff, sin_items, cos_items) in enumerate(packed):
-        coeffs[i] = coeff
-        for j, (idx, p) in enumerate(sin_items):
-            idx_sin[i, j], pow_sin[i, j] = idx, p
-        for j, (idx, p) in enumerate(cos_items):
-            idx_cos[i, j], pow_cos[i, j] = idx, p
-
-    return coeffs, idx_sin, pow_sin, idx_cos, pow_cos
 
 
 def build_ragged_arrays(
@@ -100,12 +33,14 @@ def build_ragged_arrays(
     r"""
     Convert a :data:`CoeffTerms` list into a ragged (CSR-style) layout.
 
-    :func:`build_sparse_arrays` pads every term out to ``W``, the largest number
-    of distinct parameters touched by any single term, which wastes a share of
-    every gather and product whenever the support sizes vary - and under
-    ``k1``/``k2`` truncation they vary a lot. This function instead concatenates
-    the terms' factors end to end and records how many belong to each term, so
-    there is no padding at all.
+    The layout this replaced padded every term out to ``W``, the largest
+    number of distinct parameters touched by any single term, which wastes a
+    share of every gather and product whenever the support sizes vary - and
+    under ``k1``/``k2`` truncation they vary a lot (see
+    ``tests/legacy_sparse_arrays.py`` for that layout, kept only for the test
+    suite's cross-check). This function instead concatenates the terms'
+    factors end to end and records how many belong to each term, so there is
+    no padding at all.
 
     Sine and cosine factors go into the *same* list, indexing a single lookup
     table laid out as::
