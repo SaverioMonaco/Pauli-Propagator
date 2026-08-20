@@ -3,7 +3,7 @@ Regression test for the evaluator's derivative at exact zeros of sin/cos.
 """
 import numpy as np
 
-from pprop.propagator.utils import make_sparse_evaluator
+from pprop.propagator.evaluator import make_sparse_evaluator
 
 
 def energy(theta):

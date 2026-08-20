@@ -26,7 +26,7 @@ import numpy as np
 import pennylane as qml
 
 from pprop import Propagator
-from pprop.propagator import utils
+from pprop.propagator import evaluator
 
 
 def load_baseline(ref: str = "main"):
@@ -146,7 +146,7 @@ def main() -> None:
             theta[slot] = value
         sins, coss = np.sin(theta), np.cos(theta)
 
-        _, eg_new = utils.make_sparse_evaluator(expr, ip)
+        _, eg_new = evaluator.make_sparse_evaluator(expr, ip)
         t_new = bench(eg_new, (sins, coss), a.repeats)
 
         print(f"{label}: {prop.num_params} params, {len(expr)} terms")

@@ -16,7 +16,7 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
-from pprop.propagator.utils import build_ragged_arrays
+from pprop.propagator.evaluator import build_ragged_arrays
 
 num_qubits = 3
 
