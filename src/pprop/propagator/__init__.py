@@ -33,7 +33,8 @@ import pprop_rs
 from .. import gates
 from ..pauli.sentence import PauliDict
 from .binding import BoundPropagator, Free, affine_from_exprs
-from .utils import make_sparse_evaluator, remove_duplicate_observables, requires_propagation
+from .evaluator import make_sparse_evaluator
+from .utils import remove_duplicate_observables, requires_propagation
 
 #: Gate class name (pennylane's Operator.name) -> pprop_rs gate-kind code.
 #: Must stay in sync with the kind constants at the top of
@@ -286,7 +287,7 @@ class Propagator:
         trigonometric expectation-value expression into :attr:`exprs`, then
         compiles each expression into a fast numeric callable
         (:attr:`_eval_list`/:attr:`_eval_and_grad_list`, via the "sparse"
-        gathered-array representation; see ``utils.make_sparse_evaluator``).
+        gathered-array representation; see ``evaluator.make_sparse_evaluator``).
         Idempotent: calling this again after a successful call is a no-op
         (prints a notice and returns).
 

@@ -8,6 +8,7 @@ removed in favour of the single Rust implementation. See
 personal/rust_port.tex for why.
 """
 import random
+from collections import Counter
 
 import numpy as np
 import pennylane as qml
@@ -15,6 +16,7 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
+from pprop.propagator.evaluator import build_ragged_arrays
 
 num_qubits = 3
 
@@ -292,6 +294,116 @@ def test_propagator_beyond_64_qubits():
         )
 
 
+def test_fixed_value_gates_agree_with_qml():
+    """
+    A fixed-value gate gets a hidden slot rather than a trainable index, and
+    the ragged layout indexes that slot out of the same lookup table as every
+    other factor. Value and gradient must still match param-shift, and the
+    gradient must carry one column per *trainable* parameter, not per slot.
+    """
+    def ansatz(params):
+        for layer in range(2):
+            for qubit in range(num_qubits):
+                qml.RX(params[6 * layer + 2 * qubit], wires=qubit)
+                qml.RY(params[6 * layer + 2 * qubit + 1], wires=qubit)
+            qml.CNOT(wires=[0, 1])
+            qml.CNOT(wires=[1, 2])
+            qml.CNOT(wires=[2, 0])
+            if layer == 0:
+                qml.RY(np.pi, wires=0)
+        return qml.expval(qml.PauliZ(0) @ qml.PauliZ(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    assert prop._fixed_value_slots  # RY(pi) got a hidden slot
+    assert prop._internal_num_params > prop.num_params
+
+    # The hidden slot is a real entry in the ragged table, so the expression
+    # references more parameters than the caller ever passes in.
+    _, idx, _ = build_ragged_arrays(prop.exprs[0], prop._internal_num_params)
+    assert idx.size
+
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
+    for _ in range(3):
+        params = qml.numpy.random.uniform(-np.pi, np.pi, prop.num_params)
+        val, grad = prop.eval_and_grad(params)
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+        assert np.asarray(grad).shape[-1] == prop.num_params
+
+
+def test_gradient_at_zeros_of_sin_and_cos():
+    """
+    The gradient of a term is normally formed as term * cot(theta) (and the
+    tan analogue for the cosine factors), which is singular wherever
+    sin(theta) or cos(theta) vanishes. Angles that land in such a zero take an
+    exact fallback path instead, so they must still match param-shift - these
+    are exactly the values an optimiser tends to walk into.
+    """
+    def ansatz(params):
+        qml.Hadamard(wires=0)
+        qml.RX(params[0], wires=0)
+        qml.CNOT(wires=[0, 1])
+        qml.RY(params[1], wires=1)
+        qml.RZ(params[2], wires=0)
+        return qml.expval(qml.PauliZ(0) @ qml.PauliX(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=2))
+
+    for values in ([0.0, 0.0, 0.0],
+                   [np.pi / 2, np.pi / 2, np.pi / 2],
+                   [np.pi, np.pi / 2, 0.0],
+                   [0.0, np.pi, 1e-12]):
+        params = qml.numpy.array(values, requires_grad=True)
+        val, grad = prop.eval_and_grad(np.asarray(values))
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6), (
+            f"Mismatch GRAD vs qml at params={values}"
+        )
+
+
+def test_repeated_parameter_powers_agree_with_qml():
+    """
+    When one trainable index drives several gates, a Pauli path can pick up
+    sin(theta_k) or cos(theta_k) more than once, giving powers above 1 - which
+    the evaluator carries as repeated factors rather than as an exponent. Both
+    the value and the derivative (p * sin^(p-1) * cos, including at the zeros
+    where the exact path takes over) have to come out right.
+    """
+    def ansatz(params):
+        for layer in range(3):
+            for qubit in range(num_qubits):
+                qml.RX(params[qubit % 2], wires=qubit)
+                qml.RY(params[2 + (layer + qubit) % 2], wires=qubit)
+            qml.CNOT(wires=[0, 1])
+            qml.CNOT(wires=[1, 2])
+            qml.CNOT(wires=[2, 0])
+        return qml.expval(qml.PauliZ(0) @ qml.PauliX(1) @ qml.PauliY(2))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    assert prop.num_params == 4
+
+    powers = Counter()
+    for _, sin_idx, cos_idx in prop.exprs[0]:
+        powers.update(Counter(sin_idx).values())
+        powers.update(Counter(cos_idx).values())
+    assert max(powers) > 1, "expected this circuit to produce powers above 1"
+
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
+    cases = [[0.7, -1.3, 0.2, 2.1], [0.0, 0.0, 0.0, 0.0],
+             [np.pi / 2, np.pi, 0.0, np.pi / 2]]
+    for values in cases:
+        params = qml.numpy.array(values, requires_grad=True)
+        val, grad = prop.eval_and_grad(np.asarray(values))
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6), (
+            f"Mismatch GRAD vs qml at params={values}"
+        )
+
+
 # %%
 test_propagator_agrees_with_qml()
 test_eval_n_jobs_matches_single_threaded()
@@ -299,3 +411,71 @@ test_fixed_value_parameter_is_not_aliased()
 test_controlled_rotations_agree_with_qml()
 test_bind_affine_reparametrisation_agrees_with_qml()
 test_propagator_beyond_64_qubits()
+test_fixed_value_gates_agree_with_qml()
+test_gradient_at_zeros_of_sin_and_cos()
+test_repeated_parameter_powers_agree_with_qml()
+
+
+def _uneven_width_ansatz(params):
+    """Four qubits, RY+RZ per layer: term supports come out very uneven."""
+    k = 0
+    for qubit in range(4):
+        qml.Hadamard(wires=qubit)
+    for _ in range(3):
+        for qubit in range(4):
+            qml.RY(params[k], wires=qubit); k += 1
+        for qubit in range(4):
+            qml.RZ(params[k], wires=qubit); k += 1
+        for qubit in range(3):
+            qml.CNOT(wires=[qubit, qubit + 1])
+    return qml.expval(qml.PauliZ(0) @ qml.PauliZ(3))
+
+
+def test_uneven_support_widths_agree_with_qml():
+    """
+    The ragged layout exists because term supports are uneven: the padded
+    layout sized every term to the widest one, so the rest carried slots that
+    only ever multiply by 1. This circuit spreads its supports across a wide
+    range, which is the case that used to waste the most, so pin it against
+    param-shift.
+    """
+    prop = Propagator(_uneven_width_ansatz)
+    prop.propagate()
+
+    widths = Counter(len(set(s)) + len(set(c)) for _, s, c in prop.exprs[0])
+    assert len(widths) > 4, f"expected a spread of support widths, got {dict(widths)}"
+    # The padded layout would have sized every term to the widest.
+    assert min(widths) * 2 < max(widths), dict(widths)
+
+    qnode = qml.QNode(_uneven_width_ansatz, qml.device("default.qubit", wires=4))
+    rng = np.random.default_rng(0)
+    for _ in range(3):
+        values = rng.uniform(-np.pi, np.pi, prop.num_params)
+        params = qml.numpy.array(values, requires_grad=True)
+        val, grad = prop.eval_and_grad(np.asarray(values))
+        assert np.allclose(val, qnode(params), atol=1e-6)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+
+
+def test_truncation_can_empty_an_expression():
+    """
+    k1 can discard every term an observable has, leaving nothing to evaluate.
+    The ragged evaluator special-cases that (np.multiply.reduceat has no empty
+    case), and it has to keep returning a correctly shaped zero gradient
+    rather than raising.
+    """
+    prop = Propagator(_uneven_width_ansatz, k1=2)
+    prop.propagate()
+    assert len(prop.exprs[0]) == 0, "expected k1=2 to discard everything here"
+
+    params = np.random.default_rng(0).uniform(-np.pi, np.pi, prop.num_params)
+    assert prop(params)[0] == 0.0
+
+    val, grad = prop.eval_and_grad(params)
+    assert val[0] == 0.0
+    assert grad.shape == (1, prop.num_params)
+    assert np.all(grad == 0.0)
+
+
+test_uneven_support_widths_agree_with_qml()
+test_truncation_can_empty_an_expression()
