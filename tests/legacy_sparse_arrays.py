@@ -94,3 +94,57 @@ def eval_sparse_arrays(
     sin_pow = np.where(pow_sin > 0, sin_g ** pow_sin, 1.0)
     cos_pow = np.where(pow_cos > 0, cos_g ** pow_cos, 1.0)
     return float((coeffs * sin_pow.prod(axis=1) * cos_pow.prod(axis=1)).sum())
+
+
+def eval_grad_sparse_arrays(
+    coeffs: np.ndarray,
+    idx_sin: np.ndarray,
+    pow_sin: np.ndarray,
+    idx_cos: np.ndarray,
+    pow_cos: np.ndarray,
+    sins: np.ndarray,
+    coss: np.ndarray,
+    num_params: int,
+) -> Tuple[float, np.ndarray]:
+    """
+    Value and gradient from the padded arrays of :func:`build_sparse_arrays`,
+    via exclusive prefix/suffix products over the padded ``W`` axis - the
+    approach the ragged evaluator's ``cot``/``tan`` trick replaced. Carries
+    the power-1-at-exact-zero fix (clamp the exponent, not the base, so
+    ``0.0 ** 0 == 1.0`` survives for power-1 factors sitting exactly on a
+    zero of sin/cos).
+    """
+    sin_g = sins[idx_sin]
+    cos_g = coss[idx_cos]
+    sin_pow = np.where(pow_sin > 0, sin_g ** pow_sin, 1.0)
+    cos_pow = np.where(pow_cos > 0, cos_g ** pow_cos, 1.0)
+    sin_prod, cos_prod = sin_pow.prod(axis=1), cos_pow.prod(axis=1)
+    term_vals = coeffs * sin_prod * cos_prod
+
+    def excl(pow_arr: np.ndarray) -> np.ndarray:
+        m = pow_arr.shape[0]
+        left = np.cumprod(np.concatenate([np.ones((m, 1)), pow_arr[:, :-1]], axis=1), axis=1)
+        right = np.cumprod(np.concatenate([pow_arr[:, 1:], np.ones((m, 1))], axis=1)[:, ::-1], axis=1)[:, ::-1]
+        return left * right
+
+    excl_sin, excl_cos = excl(sin_pow), excl(cos_pow)
+    cos_at_sin, sin_at_cos = coss[idx_sin], sins[idx_cos]
+
+    d_sin = np.where(
+        pow_sin > 0,
+        pow_sin * sin_g ** np.maximum(pow_sin - 1.0, 0.0) * cos_at_sin,
+        0.0,
+    )
+    d_cos = np.where(
+        pow_cos > 0,
+        -pow_cos * cos_g ** np.maximum(pow_cos - 1.0, 0.0) * sin_at_cos,
+        0.0,
+    )
+
+    sin_grad_terms = coeffs[:, None] * d_sin * excl_sin * cos_prod[:, None]
+    cos_grad_terms = coeffs[:, None] * sin_prod[:, None] * excl_cos * d_cos
+
+    grad = np.zeros(num_params)
+    np.add.at(grad, idx_sin.ravel(), sin_grad_terms.ravel())
+    np.add.at(grad, idx_cos.ravel(), cos_grad_terms.ravel())
+    return float(term_vals.sum()), grad

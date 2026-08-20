@@ -4,7 +4,7 @@ Regression test for the evaluator's derivative at exact zeros of sin/cos.
 import numpy as np
 
 from pprop.propagator.evaluator import make_sparse_evaluator
-from legacy_sparse_arrays import build_sparse_arrays, eval_sparse_arrays
+from legacy_sparse_arrays import build_sparse_arrays, eval_grad_sparse_arrays, eval_sparse_arrays
 
 
 def energy(theta):
@@ -58,7 +58,7 @@ def test_ragged_evaluator_agrees_with_legacy_padded_arrays():
         (1.5, [1, 1, 1], [3]),     # width 4: sin(b)^3 cos(d)
     ]
 
-    eval_new, _ = make_sparse_evaluator(expr, num_params)
+    eval_new, evalgrad_new = make_sparse_evaluator(expr, num_params)
     coeffs, idx_sin, pow_sin, idx_cos, pow_cos = build_sparse_arrays(expr, num_params)
 
     rng = np.random.default_rng(0)
@@ -70,4 +70,13 @@ def test_ragged_evaluator_agrees_with_legacy_padded_arrays():
         v_legacy = eval_sparse_arrays(coeffs, idx_sin, pow_sin, idx_cos, pow_cos, sins, coss)
         assert np.isclose(v_new, v_legacy, atol=1e-12), (
             f"theta={theta}: ragged={v_new}, legacy padded={v_legacy}"
+        )
+
+        v_new, g_new = evalgrad_new(sins, coss)
+        v_legacy, g_legacy = eval_grad_sparse_arrays(
+            coeffs, idx_sin, pow_sin, idx_cos, pow_cos, sins, coss, num_params
+        )
+        assert np.isclose(v_new, v_legacy, atol=1e-12)
+        assert np.allclose(g_new, g_legacy, atol=1e-12), (
+            f"theta={theta}: ragged grad={g_new}, legacy padded grad={g_legacy}"
         )
