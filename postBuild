@@ -1,0 +1,8 @@
+#!/bin/bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+
+pip install -e .
+pip install maturin
+cd native/pprop_rs
+maturin develop --release
