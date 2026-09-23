@@ -20,6 +20,7 @@ performance numbers versus the pure-Python implementation this replaced.
 ...     return [qml.expval(qml.PauliZ(0))]
 >>> prop = Propagator(ansatz, k1 = None, k2 = None)
 """
+import gc
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Sequence, Tuple, Union
@@ -359,15 +360,24 @@ class Propagator:
                     spec.append((x_words, z_words, float(c), list(s), list(cc)))
             rust_paulidicts.append(spec)
 
-        self.exprs = pprop_rs.propagate_batch(
-            self.num_qubits,
-            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
-            self.k1 if self.k1 is not None else -1,
-            self.k2 if self.k2 is not None else -1,
-            coeff_threshold if coeff_threshold is not None else -1.0,
-            use_dead_qubit_pruner, use_xy_weight_pruner,
-            rust_paulidicts,
-        )
+        # The result holds two Python lists per term. Allocating hundreds of
+        # thousands of them would set off the cyclic garbage collector again
+        # and again, although lists of ints cannot form a cycle.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            self.exprs = pprop_rs.propagate_batch(
+                self.num_qubits,
+                gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
+                self.k1 if self.k1 is not None else -1,
+                self.k2 if self.k2 is not None else -1,
+                coeff_threshold if coeff_threshold is not None else -1.0,
+                use_dead_qubit_pruner, use_xy_weight_pruner,
+                rust_paulidicts,
+            )
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         self.eval_n_jobs = eval_n_jobs
         self._executor: Optional[ThreadPoolExecutor] = None
