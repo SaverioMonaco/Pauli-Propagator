@@ -23,7 +23,7 @@ copyright = '2026, Saverio Monaco'
 author = 'Saverio Monaco'
 
 # The full version, including alpha/beta/rc tags
-release = '2.0.1'
+release = '3.1.0'
 
 
 # -- General configuration ---------------------------------------------------
@@ -40,6 +40,12 @@ extensions = [
 
 autosummary_generate = True
 autodoc_typehints = "description"
+
+# pprop_rs is a compiled Rust extension (native/pprop_rs, built via maturin)
+# that Read the Docs' plain `pip install .` never builds, so autodoc can't
+# import anything that touches it. Mock it out so autodoc can still
+# introspect the surrounding pure-Python code.
+autodoc_mock_imports = ["pprop_rs"]
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
 html_show_sourcelink = True
