@@ -1,7 +1,10 @@
 [project]
 name = "Pauli-Propagation"
-version = "3.0.0"
-authors = [{ name = "Saverio Monaco", email = "saverio.monaco@desy.de" }]
+version = "3.1.0"
+authors = [
+    { name = "Saverio Monaco", email = "saverio.monaco@desy.de" },
+    { name = "Aapo Lipponen", email = "aapo.lipponen@gmail.com" },
+]
 description = "A Pennylane-based toolkit for approximate symbolic Pauli propagation and evaluation of quantum circuit observables."
 readme = "README.md"
 requires-python = ">=3.12"

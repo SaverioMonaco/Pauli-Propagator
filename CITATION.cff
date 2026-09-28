@@ -4,17 +4,10 @@ authors:
 - family-names: "Monaco"
   given-names: "Saverio"
   orcid: "https://orcid.org/0000-0001-8784-5011"
-- family-names: "Slim"
-  given-names: "Jamal"
-  orchid: "https://orcid.org/0000-0002-9418-8459"
-- family-names: "Krücker"
-  given-names: "Dirk"
-  orchid: "https://orcid.org/0000-0003-1610-8844"
-- family-names: "Borras"
-  given-names: "Kerstin"
-  orchid: "https://orcid.org/0000-0003-1111-249X"
+- family-names: "Lipponen"
+  given-names: "Aapo"
 title: "Pauli-Propagator"
-version: 3.0.0
+version: 3.1.0
 doi: 10.5281/zenodo.21650428
-date-released: 2026-02-19
+date-released: 2026-09-28
 url: "https://github.com/SaverioMonaco/Pauli-Propagator"

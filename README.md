@@ -109,15 +109,12 @@ If you use this software in your research or publications, **please cite** the f
 
 ```
 @software{monaco_2026_21650428,
-  author       = {Monaco, Saverio and
-                  Slim, Jamal and
-                  Krücker, Dirk and
-                  Borras, Kerstin},
+  author       = {Monaco, Saverio and Lipponen, Aapo},
   title        = {Pauli-Propagator},
-  month        = jul,
+  month        = sep,
   year         = 2026,
   publisher    = {Zenodo},
-  version      = {v3.0.0},
+  version      = {v3.1.0},
   doi          = {10.5281/zenodo.21650428},
   url          = {https://doi.org/10.5281/zenodo.21650428},
   swhid        = {swh:1:dir:0e10e302f29117d01a4a7cfa852f83bdf66516af
