@@ -1,5 +1,5 @@
 # Pauli Propagation of Parametrized Circuits
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21650428.svg)](https://doi.org/10.5281/zenodo.21650428)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23020043.svg)](https://doi.org/10.5281/zenodo.23020043)
 
 Try it without installation. via Binder: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/SaverioMonaco/Pauli-Propagator/HEAD?urlpath=%2Fdoc%2Ftree%2Fnotebooks%2Fshowcase.ipynb)
 
@@ -108,21 +108,15 @@ the propagator.
 If you use this software in your research or publications, **please cite** the following: 
 
 ```
-@software{monaco_2026_21650428,
-  author       = {Monaco, Saverio and Lipponen, Aapo},
+@software{monaco_2026_23020043,
+  author       = {Monaco, Saverio and
+                  Lipponen, Aapo},
   title        = {Pauli-Propagator},
   month        = sep,
   year         = 2026,
   publisher    = {Zenodo},
   version      = {v3.1.0},
-  doi          = {10.5281/zenodo.21650428},
-  url          = {https://doi.org/10.5281/zenodo.21650428},
-  swhid        = {swh:1:dir:0e10e302f29117d01a4a7cfa852f83bdf66516af
-                   ;origin=https://doi.org/10.5281/zenodo.16028009;vi
-                   sit=swh:1:snp:b5633dca582c01236505003571f40545233e
-                   6421;anchor=swh:1:rel:d48663d88eab0a338349cf841036
-                   3648b370de81;path=SaverioMonaco-Pauli-Propagator-
-                   cc07b8e
-                  },
+  doi          = {10.5281/zenodo.23020043},
+  url          = {https://doi.org/10.5281/zenodo.23020043},
 }
 ```
