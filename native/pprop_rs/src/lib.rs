@@ -48,6 +48,7 @@
 //! bit 6 -> `(x[1] >> 6) & 1 = 1`, `(z[1] >> 6) & 1 = 0` -> x-bit set,
 //! z-bit clear -> X.
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
@@ -87,8 +88,62 @@ struct GateSpec<const NW: usize> {
     kind: u8,
     wire0: u32,
     wire1: i64, // -1 unless two-qubit
-    param: i64, // -1 unless parametrised
+    param: i64, // -1 unless read from a trainable parameter slot
+    // Constant angle of a rotation/controlled-rotation gate that was given a
+    // plain float rather than a trainable index (e.g. `qml.RY(np.pi, wires=0)`).
+    // `None` for trainable and non-parametrised gates. See `fixed_sin_cos`.
+    fixed: Option<f64>,
     wire_mask: [u64; NW],
+}
+
+// ---------------------------------------------------------------------
+// Fixed-angle folding
+// ---------------------------------------------------------------------
+//
+// A rotation given a constant angle contributes constant factors, not
+// trigonometric ones, so - exactly like the T gate's 1/sqrt(2) - they are
+// multiplied straight into each term's coefficient instead of being pushed
+// onto its sin/cos index lists. Two things follow:
+//
+//   * a branch whose folded factor is zero is dropped before it is ever
+//     created. At any multiple of pi/2 one of sin/cos vanishes, so a fixed
+//     RY(pi) or CRX(pi) splits nothing and the term count stays what it
+//     would be without the gate;
+//   * a fixed gate no longer counts towards the `k2` frequency cutoff, which
+//     makes it consistent with T (a constant is a constant).
+//
+// `FOLD_SNAP` is the one judgement call: `f64::sin(PI)` is 1.22e-16, not 0,
+// and without snapping to a true zero the dead branch survives carrying
+// float noise. The worst case of snapping is dropping a term of size
+// |coeff| * 1e-12 per snapped factor, before accumulation across terms/gates.
+// This also snaps genuinely nonzero factors near quarter turns. It is an
+// approximation, not a test that an angle is exactly Clifford; large
+// observable coefficients amplify its absolute error (see propagate docs).
+
+const FOLD_SNAP: f64 = 1e-12;
+
+#[inline]
+fn snap(v: f64) -> f64 {
+    if v.abs() < FOLD_SNAP { 0.0 } else { v }
+}
+
+/// `(sin(theta), cos(theta))` of a fixed angle, with exact zeros at the
+/// quarter turns. Callers pass the angle in whatever convention the gate's
+/// rule table is written in (the full angle for RX/RY/RZ, the half angle
+/// for CRX/CRY/CRZ - see `controlledrotation.py`).
+fn fixed_sin_cos(theta: f64) -> (f64, f64) {
+    let (s, c) = theta.sin_cos();
+    (snap(s), snap(c))
+}
+
+/// Multiply every term's coefficient by a constant, in place.
+fn scale_terms(mut terms: Vec<CoeffTerm>, factor: f64) -> Vec<CoeffTerm> {
+    if factor != 1.0 {
+        for t in terms.iter_mut() {
+            t.0 *= factor;
+        }
+    }
+    terms
 }
 
 // ---------------------------------------------------------------------
@@ -534,9 +589,10 @@ fn crz_rule(code: u8) -> Option<CRRule> {
 
 /// RX/RY/RZ shape: commuting Pauli passes through; anti-commuting Pauli
 /// splits into a cos(theta) branch (same word) and a sign*sin(theta) branch
-/// (new word).
+/// (new word). With a fixed angle the two factors are constants folded into
+/// the coefficients, and a branch whose factor is zero is not created.
 fn evolve_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<(u8, i8)>,
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
@@ -545,6 +601,21 @@ fn evolve_rotation<const NW: usize>(
         None => insert_or_extend(map, (x, z), terms),
         Some((out_label, sign)) => {
             let new_key = set_label(x, z, wire, out_label);
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta);
+                let s = sign as f64 * s;
+                if c != 0.0 && s != 0.0 {
+                    let cos_terms = scale_terms(terms.clone(), c);
+                    insert_or_extend(map, (x, z), cos_terms);
+                    insert_or_extend(map, new_key, scale_terms(terms, s));
+                } else if c != 0.0 {
+                    insert_or_extend(map, (x, z), scale_terms(terms, c));
+                } else if s != 0.0 {
+                    insert_or_extend(map, new_key, scale_terms(terms, s));
+                }
+                // sin and cos cannot both snap to zero; nothing to do otherwise.
+                return;
+            }
             let p = param as u32;
             let cos_terms: Vec<CoeffTerm> = terms
                 .iter()
@@ -653,8 +724,11 @@ fn evolve_controlled<const NW: usize>(
 /// CRX/CRY/CRZ shape: commuting word passes through; otherwise up to 4
 /// output words, each scaling every existing term by a constant coefficient
 /// and appending 0-2 copies of the gate's parameter index to sin_idx/cos_idx.
+/// With a fixed angle those sin/cos powers are evaluated at the *half* angle
+/// (the rule tables are written in theta/2, see `controlledrotation.py`) and
+/// folded into the coefficient; branches whose factor is zero are dropped.
 fn evolve_controlled_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<CRRule>,
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
@@ -664,6 +738,19 @@ fn evolve_controlled_rotation<const NW: usize>(
     match rule(code) {
         None => insert_or_extend(map, (x, z), terms),
         Some(branches) => {
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta / 2.0);
+                for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
+                    let factor = coeff * s.powi(n_sin as i32) * c.powi(n_cos as i32);
+                    if factor == 0.0 {
+                        continue;
+                    }
+                    let (nx, nz) = set_label(x, z, control, out_c);
+                    let (nx, nz) = set_label(nx, nz, target, out_t);
+                    insert_or_extend(map, (nx, nz), scale_terms(terms.clone(), factor));
+                }
+                return;
+            }
             let p = param as u32;
             for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
                 let (nx, nz) = set_label(x, z, control, out_c);
@@ -703,9 +790,9 @@ fn evolve_one_gate<const NW: usize>(
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
     match gate.kind {
-        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, rx_rule, map),
-        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, ry_rule, map),
-        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, rz_rule, map),
+        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rx_rule, map),
+        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, ry_rule, map),
+        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rz_rule, map),
         H => evolve_clifford1q(x, z, terms, gate.wire0, h_rule, map),
         S => evolve_clifford1q(x, z, terms, gate.wire0, s_rule, map),
         SX => evolve_clifford1q(x, z, terms, gate.wire0, sx_rule, map),
@@ -714,9 +801,9 @@ fn evolve_one_gate<const NW: usize>(
         CNOT => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cnot_rule, map),
         CY => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cy_rule, map),
         CZ => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cz_rule, map),
-        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crx_rule, map),
-        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, cry_rule, map),
-        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crz_rule, map),
+        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crx_rule, map),
+        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, cry_rule, map),
+        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crz_rule, map),
         _ => unreachable!("unknown gate kind {}", gate.kind),
     }
 }
@@ -821,6 +908,7 @@ fn propagate_batch_impl<const NW: usize>(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -841,6 +929,7 @@ fn propagate_batch_impl<const NW: usize>(
             wire0: gate_wire0[i],
             wire1: gate_wire1[i],
             param: gate_param[i],
+            fixed: gate_fixed[i],
             wire_mask,
         });
     }
@@ -907,7 +996,7 @@ macro_rules! dispatch_nw {
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits,
-    gate_kind, gate_wire0, gate_wire1, gate_param,
+    gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
     k1, k2, coeff_threshold,
     use_dead_qubit_pruner, use_xy_weight_pruner,
     paulidicts,
@@ -919,6 +1008,7 @@ fn propagate_batch(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -930,7 +1020,7 @@ fn propagate_batch(
     dispatch_nw!(
         nw, num_qubits, propagate_batch_impl,
         (
-            gate_kind, gate_wire0, gate_wire1, gate_param,
+            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
             k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
             paulidicts,
         )
@@ -942,6 +1032,7 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     wire0: u32,
     wire1: i64,
     param: i64,
+    fixed: Option<f64>,
     x: &[u64],
     z: &[u64],
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
@@ -951,7 +1042,7 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     if wire1 >= 0 {
         set_wire_bit(&mut wire_mask, wire1 as u32);
     }
-    let gate = GateSpec::<NW> { kind, wire0, wire1, param, wire_mask };
+    let gate = GateSpec::<NW> { kind, wire0, wire1, param, fixed, wire_mask };
     let mut map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> = FxHashMap::default();
     evolve_one_gate(&gate, words_to_array::<NW>(x), words_to_array::<NW>(z), terms, &mut map);
     map.into_iter()
@@ -966,8 +1057,11 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
 /// `propagate_batch`). Used by `tests/test_rule_tables.py` to cross-check
 /// every gate's `rule` dict in `pprop/gates/*.py` directly against this
 /// file's rule tables, term-for-term, independent of whether the output
-/// happens to land in the Z/I subspace.
+/// happens to land in the Z/I subspace. `fixed` is the constant angle of a
+/// non-trainable rotation (see `GateSpec::fixed`); leave it `None` for a
+/// trainable one.
 #[pyfunction]
+#[pyo3(signature = (num_qubits, kind, wire0, wire1, param, x, z, terms, fixed = None))]
 #[allow(clippy::too_many_arguments)]
 fn evolve_single_gate_debug(
     num_qubits: u32,
@@ -978,17 +1072,293 @@ fn evolve_single_gate_debug(
     x: Vec<u64>,
     z: Vec<u64>,
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    fixed: Option<f64>,
 ) -> PyResult<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>> {
     let nw = words_needed(num_qubits);
     Ok(dispatch_nw!(
         nw, num_qubits, evolve_single_gate_debug_impl,
-        (kind, wire0, wire1, param, &x, &z, terms)
+        (kind, wire0, wire1, param, fixed, &x, &z, terms)
     ))
+}
+
+/// Add `term` to the accumulator slot of every factor in `run`, spreading
+/// consecutive factors over `C` interleaved copies of the accumulator so that
+/// a recurring parameter does not stall on the previous read-modify-write.
+///
+/// The writes skip bounds checking: `Evaluator::new` rejects any index that
+/// does not address one copy, and `acc` is `C * width` long.
+#[inline]
+fn scatter<const C: usize>(run: &[u32], term: f64, acc: &mut [f64], width: usize) {
+    let mut chunks = run.chunks_exact(C);
+    for chunk in &mut chunks {
+        for (copy, &entry) in chunk.iter().enumerate() {
+            unsafe { *acc.get_unchecked_mut(copy * width + entry as usize) += term };
+        }
+    }
+    for &entry in chunks.remainder() {
+        unsafe { *acc.get_unchecked_mut(entry as usize) += term };
+    }
+}
+
+/// Compiled evaluator for one propagated expression, mirroring the NumPy
+/// implementation in `pprop.propagator.evaluator` (see `build_ragged_arrays`
+/// there for how `coeffs`/`idx`/`cnt` are produced and what the index space
+/// means). Everything below is that same arithmetic with the intermediate
+/// arrays removed: the terms are walked once, factor by factor, keeping the
+/// running products in registers rather than materialising one temporary per
+/// pass.
+///
+/// Index space, with `P = num_params`: a factor `sin(theta_k)` is `k`, a
+/// factor `cos(theta_k)` is `P + 1 + k`, and `P` itself is a sentinel whose
+/// value is 1 (it stands in for a term with no factors left). Powers are
+/// repeated indices, so no exponent is ever evaluated.
+#[pyclass]
+pub struct Evaluator {
+    coeffs: Vec<f64>,
+    idx: Vec<u32>,
+    /// Start of each term's run in `idx`, with a closing entry: length is
+    /// `coeffs.len() + 1`.
+    off: Vec<usize>,
+    num_params: usize,
+    /// Longest single term, i.e. the scratch space the exact path needs.
+    max_run: usize,
+    /// How many interleaved copies of the gradient accumulator to keep -
+    /// 4, 2 or 1, whichever fits in L1 for this parameter count. See
+    /// `scatter`.
+    acc_copies: usize,
+    tol: f64,
+}
+
+impl Evaluator {
+    /// `[sin(theta_0..P-1), 1.0, cos(theta_0..P-1)]`, the table `idx` reads.
+    fn table(&self, sins: &[f64], coss: &[f64]) -> Vec<f64> {
+        let p = self.num_params;
+        let mut table = Vec::with_capacity(2 * p + 1);
+        table.extend_from_slice(sins);
+        table.push(1.0);
+        table.extend_from_slice(coss);
+        table
+    }
+
+    /// Product of one term's factors. Four independent accumulators, so the
+    /// multiplies pipeline instead of forming one dependency chain per term.
+    ///
+    /// The table lookups skip bounds checking: `new` rejects any index that
+    /// does not address `table`, which is the only place `idx` is set.
+    #[inline]
+    fn term_product(&self, table: &[f64], start: usize, end: usize) -> f64 {
+        debug_assert!(table.len() == 2 * self.num_params + 1);
+        let run = &self.idx[start..end];
+        let (mut a, mut b, mut c, mut d) = (1.0, 1.0, 1.0, 1.0);
+        let mut chunks = run.chunks_exact(4);
+        for chunk in &mut chunks {
+            unsafe {
+                a *= *table.get_unchecked(chunk[0] as usize);
+                b *= *table.get_unchecked(chunk[1] as usize);
+                c *= *table.get_unchecked(chunk[2] as usize);
+                d *= *table.get_unchecked(chunk[3] as usize);
+            }
+        }
+        for &entry in chunks.remainder() {
+            a *= unsafe { *table.get_unchecked(entry as usize) };
+        }
+        (a * b) * (c * d)
+    }
+
+    /// Gradient via the logarithmic derivative: every factor on parameter `k`
+    /// contributes `term * cot(theta_k)` (or `-term * tan(theta_k)` for a
+    /// cosine), which depends only on `k`. So the factors just accumulate
+    /// term values per parameter and the cot/tan multiply happens once over
+    /// the parameter vector. Requires every angle to sit away from a zero of
+    /// sin/cos; `grad_exact` handles the rest.
+    fn grad_fast(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
+        let p = self.num_params;
+        let table = self.table(sins, coss);
+        let width = 2 * p + 1;
+        // Consecutive factors are scattered into *different* copies of the
+        // accumulator, so a parameter that recurs within a few factors does
+        // not stall waiting on the previous read-modify-write. The copies are
+        // summed back together at the end.
+        let copies = self.acc_copies;
+        let mut acc = vec![0.0f64; copies * width];
+        let mut value = 0.0;
+
+        for t in 0..self.coeffs.len() {
+            let (start, end) = (self.off[t], self.off[t + 1]);
+            let term = self.coeffs[t] * self.term_product(&table, start, end);
+            value += term;
+            let run = &self.idx[start..end];
+            match copies {
+                4 => scatter::<4>(run, term, &mut acc, width),
+                2 => scatter::<2>(run, term, &mut acc, width),
+                _ => scatter::<1>(run, term, &mut acc, width),
+            }
+        }
+
+        for k in 0..p {
+            let mut sin_total = 0.0;
+            let mut cos_total = 0.0;
+            for c in 0..copies {
+                sin_total += acc[c * width + k];
+                cos_total += acc[c * width + p + 1 + k];
+            }
+            grad[k] = (coss[k] / sins[k]) * sin_total - (sins[k] / coss[k]) * cos_total;
+        }
+        value
+    }
+
+    /// Gradient without dividing by anything: for each term, walk its factors
+    /// forwards recording partial products, then backwards multiplying by the
+    /// running suffix, which gives the product of all *other* factors exactly.
+    /// Costs a second pass over each term and some scratch, and is used only
+    /// when an angle sits at (or extremely near) a zero of sin or cos, where
+    /// the cot/tan form above is singular. Repeated indices come out right on
+    /// their own: p copies each contribute the product of the other p-1.
+    fn grad_exact(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
+        let p = self.num_params;
+        let table = self.table(sins, coss);
+        let mut prefix = vec![0.0f64; self.max_run];
+        let mut value = 0.0;
+
+        for t in 0..self.coeffs.len() {
+            let (start, end) = (self.off[t], self.off[t + 1]);
+            let coeff = self.coeffs[t];
+
+            let mut running = 1.0;
+            for (j, i) in (start..end).enumerate() {
+                prefix[j] = running;
+                running *= table[self.idx[i] as usize];
+            }
+            value += coeff * running;
+
+            let mut suffix = 1.0;
+            for (j, i) in (start..end).enumerate().rev() {
+                let entry = self.idx[i] as usize;
+                let excluding = coeff * prefix[j] * suffix;
+                if entry < p {
+                    grad[entry] += excluding * coss[entry];        // d sin / d theta
+                } else if entry > p {
+                    let k = entry - (p + 1);
+                    grad[k] -= excluding * sins[k];                // d cos / d theta
+                }
+                suffix *= table[entry];
+            }
+        }
+        value
+    }
+}
+
+#[pymethods]
+impl Evaluator {
+    /// `coeffs`, `idx` and `cnt` are the arrays `build_ragged_arrays` returns,
+    /// as buffers (`float64`, `uint32`, `uint32`).
+    #[new]
+    #[pyo3(signature = (coeffs, idx, cnt, num_params, tol = 1e-6))]
+    fn new(
+        coeffs: &Bound<'_, PyAny>,
+        idx: &Bound<'_, PyAny>,
+        cnt: &Bound<'_, PyAny>,
+        num_params: usize,
+        tol: f64,
+    ) -> PyResult<Self> {
+        let coeffs = read_f64(coeffs)?;
+        let idx = read_u32(idx)?;
+        let cnt = read_u32(cnt)?;
+        if cnt.len() != coeffs.len() {
+            return Err(PyValueError::new_err("coeffs and cnt must have equal length"));
+        }
+
+        let mut off = Vec::with_capacity(cnt.len() + 1);
+        let mut total = 0usize;
+        off.push(0);
+        for &c in &cnt {
+            total += c as usize;
+            off.push(total);
+        }
+        if total != idx.len() {
+            return Err(PyValueError::new_err("cnt does not add up to len(idx)"));
+        }
+        let limit = 2 * num_params + 1;
+        if idx.iter().any(|&i| i as usize >= limit) {
+            return Err(PyValueError::new_err("factor index out of range"));
+        }
+
+        let max_run = cnt.iter().map(|&c| c as usize).max().unwrap_or(0);
+        // Keep the interleaved accumulators inside ~16 KB, i.e. half of a
+        // typical L1, or the trick costs more in misses than it saves. Wide
+        // parameter vectors settle for two copies, or one.
+        let width = 2 * num_params + 1;
+        let bytes = width * std::mem::size_of::<f64>();
+        let acc_copies = [4, 2, 1].into_iter().find(|c| c * bytes <= 16 * 1024).unwrap_or(1);
+        Ok(Evaluator { coeffs, idx, off, num_params, max_run, acc_copies, tol })
+    }
+
+    /// Expectation value at the given `sin(theta)`/`cos(theta)`.
+    fn eval(&self, py: Python<'_>, sins: &Bound<'_, PyAny>, coss: &Bound<'_, PyAny>)
+        -> PyResult<f64>
+    {
+        let sins = self.read_angles(sins)?;
+        let coss = self.read_angles(coss)?;
+        Ok(py.allow_threads(|| {
+            let table = self.table(&sins, &coss);
+            (0..self.coeffs.len())
+                .map(|t| self.coeffs[t] * self.term_product(&table, self.off[t], self.off[t + 1]))
+                .sum()
+        }))
+    }
+
+    /// Expectation value, writing the gradient into `out` (`float64`, length
+    /// `num_params`) rather than allocating a fresh array per call.
+    fn eval_and_grad(
+        &self,
+        py: Python<'_>,
+        sins: &Bound<'_, PyAny>,
+        coss: &Bound<'_, PyAny>,
+        out: &Bound<'_, PyAny>,
+    ) -> PyResult<f64> {
+        let sins = self.read_angles(sins)?;
+        let coss = self.read_angles(coss)?;
+        let buffer = PyBuffer::<f64>::get_bound(out)?;
+        if buffer.item_count() != self.num_params || buffer.readonly() {
+            return Err(PyValueError::new_err("out must be a writable float64 array of length num_params"));
+        }
+
+        let mut grad = vec![0.0f64; self.num_params];
+        let value = py.allow_threads(|| {
+            let singular = sins.iter().chain(coss.iter()).any(|v| v.abs() < self.tol);
+            if singular {
+                self.grad_exact(&sins, &coss, &mut grad)
+            } else {
+                self.grad_fast(&sins, &coss, &mut grad)
+            }
+        });
+        buffer.copy_from_slice(py, &grad)?;
+        Ok(value)
+    }
+}
+
+impl Evaluator {
+    fn read_angles(&self, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+        let values = read_f64(obj)?;
+        if values.len() != self.num_params {
+            return Err(PyValueError::new_err("sins/coss must have length num_params"));
+        }
+        Ok(values)
+    }
+}
+
+fn read_f64(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    PyBuffer::<f64>::get_bound(obj)?.to_vec(obj.py())
+}
+
+fn read_u32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    PyBuffer::<u32>::get_bound(obj)?.to_vec(obj.py())
 }
 
 #[pymodule]
 fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(propagate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
+    m.add_class::<Evaluator>()?;
     Ok(())
 }

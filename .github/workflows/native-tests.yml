@@ -1,0 +1,23 @@
+name: Native extension tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  native-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python -m pip install . pytest ./native/pprop_rs
+      - name: Require the native implementation and run the full suite
+        run: python -m pytest tests/ -q
+        env:
+          PPROP_REQUIRE_NATIVE: '1'
