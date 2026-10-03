@@ -52,7 +52,9 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyByteArray;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // One trigonometric product term as Python sees it: (coeff, sin_indices,
 // cos_indices) means coeff * prod(sin(theta_i) for i in sin_indices) *
@@ -71,7 +73,7 @@ type CoeffTerm = (f64, Vec<u32>, Vec<u32>);
 #[derive(Clone, Copy)]
 struct Term {
     coeff: f64,
-    mono: u32,
+    mono: MonoRef,
     depth: u32,
 }
 
@@ -103,45 +105,77 @@ impl Term {
 type PauliKey<const NW: usize> = ([u64; NW], [u64; NW]);
 // Output of evolving words through one gate, before truncation and insertion.
 type Emitted<const NW: usize> = Vec<(PauliKey<NW>, Vec<Term>)>;
+// Pauli word -> its current coefficient, for the words one thread owns.
+type WordMap<const NW: usize> = FxHashMap<PauliKey<NW>, Vec<Term>>;
 
 // ---------------------------------------------------------------------
-// Monomial arena
+// Monomial arenas
 // ---------------------------------------------------------------------
 //
 // Every monomial is a node holding one sin/cos factor and a link to the
-// monomial it extends; node 0 (`ROOT`) is the empty product. Appending a
-// factor is one push, and the sin and cos branches of a rotation share
-// their parent's whole chain instead of each copying it. A node's factors
-// are read back by walking to the root, which yields them newest first;
-// `to_lists` reverses that, so the index lists come out in the same order
-// they were appended in.
+// monomial it extends; `ROOT` is the empty product. Appending a factor is
+// one push, and the sin and cos branches of a rotation share their parent's
+// whole chain instead of each copying it. A node's factors are read back by
+// walking to the root, which yields them newest first; `to_lists` reverses
+// that, so the index lists come out in the same order they were appended in.
+//
+// Each propagation thread appends to an arena of its own, so a node
+// reference (`MonoRef`) carries the arena it lives in in its top
+// `ARENA_BITS` bits. A chain can cross arenas: a term built on one thread
+// can be extended on another after it has moved to that thread's shard.
 //
 // Nodes are never freed individually. Terms dropped by pruning or
-// truncation leave dead nodes behind, so `compact` rebuilds the arena
-// from the live terms once it has grown enough (see `heisenberg_one`).
+// truncation leave dead nodes behind, so `compact` rebuilds the arenas
+// from the live terms once they have grown enough (see `heisenberg_one`).
+
+type MonoRef = u32;
+
+const ARENA_BITS: u32 = 5;
+const INDEX_BITS: u32 = 32 - ARENA_BITS;
+/// Most threads one propagation will use (one arena each).
+const MAX_ARENAS: usize = 1 << ARENA_BITS;
+/// Most nodes one arena can hold (8 bytes each, so 1 GiB).
+const ARENA_CAPACITY: usize = 1 << INDEX_BITS;
+
+#[inline]
+fn mono_ref(arena: usize, index: usize) -> MonoRef {
+    ((arena as u32) << INDEX_BITS) | index as u32
+}
+
+#[inline]
+fn split_ref(r: MonoRef) -> (usize, usize) {
+    (
+        (r >> INDEX_BITS) as usize,
+        (r & (ARENA_CAPACITY as u32 - 1)) as usize,
+    )
+}
 
 #[derive(Clone, Copy)]
 struct Node {
-    parent: u32,
+    parent: MonoRef,
     factor: u32, // param << 1 | is_sin
 }
 
-const ROOT: u32 = 0;
-// Compaction never runs below this many nodes (8 bytes each).
+/// Node 0 of arena 0.
+const ROOT: MonoRef = 0;
+// Compaction never runs below this many nodes in total.
 const MIN_COMPACT_NODES: usize = 1 << 23;
 
 struct Monomials {
+    arena: usize,
     nodes: Vec<Node>,
 }
 
 impl Monomials {
-    fn new() -> Self {
-        Monomials {
-            nodes: vec![Node {
+    fn new(arena: usize) -> Self {
+        let mut nodes = Vec::new();
+        if arena == 0 {
+            nodes.push(Node {
                 parent: ROOT,
                 factor: 0,
-            }],
+            });
         }
+        Monomials { arena, nodes }
     }
 
     fn len(&self) -> usize {
@@ -149,14 +183,18 @@ impl Monomials {
     }
 
     #[inline]
-    fn push(&mut self, parent: u32, param: u32, is_sin: bool) -> u32 {
-        let id = self.nodes.len();
-        assert!(id < u32::MAX as usize, "monomial arena exceeded u32 ids");
+    fn push(&mut self, parent: MonoRef, param: u32, is_sin: bool) -> MonoRef {
+        let index = self.nodes.len();
+        assert!(
+            index < ARENA_CAPACITY,
+            "pprop_rs: a monomial arena outgrew {} nodes within one layer",
+            ARENA_CAPACITY
+        );
         self.nodes.push(Node {
             parent,
             factor: (param << 1) | is_sin as u32,
         });
-        id as u32
+        mono_ref(self.arena, index)
     }
 
     fn term_from_lists(&mut self, coeff: f64, sin_idx: &[u32], cos_idx: &[u32]) -> Term {
@@ -173,53 +211,123 @@ impl Monomials {
         }
         term
     }
+}
 
-    fn to_lists(&self, term: &Term) -> (Vec<u32>, Vec<u32>) {
-        let depth = term.depth as usize;
-        let mut sin_idx = Vec::with_capacity(depth);
-        let mut cos_idx = Vec::with_capacity(depth);
-        let mut id = term.mono;
-        while id != ROOT {
-            let node = self.nodes[id as usize];
-            if node.factor & 1 == 1 {
-                sin_idx.push(node.factor >> 1);
-            } else {
-                cos_idx.push(node.factor >> 1);
-            }
-            id = node.parent;
+#[inline]
+fn node_at(arenas: &[Monomials], r: MonoRef) -> Node {
+    let (a, i) = split_ref(r);
+    arenas[a].nodes[i]
+}
+
+fn to_lists(arenas: &[Monomials], term: &Term) -> (Vec<u32>, Vec<u32>) {
+    let depth = term.depth as usize;
+    let mut sin_idx = Vec::with_capacity(depth);
+    let mut cos_idx = Vec::with_capacity(depth);
+    let mut id = term.mono;
+    while id != ROOT {
+        let node = node_at(arenas, id);
+        if node.factor & 1 == 1 {
+            sin_idx.push(node.factor >> 1);
+        } else {
+            cos_idx.push(node.factor >> 1);
         }
-        sin_idx.reverse();
-        cos_idx.reverse();
-        (sin_idx, cos_idx)
+        id = node.parent;
     }
+    sin_idx.reverse();
+    cos_idx.reverse();
+    (sin_idx, cos_idx)
+}
 
-    /// Rebuild the arena from the monomials `map` still references, and
-    /// rewrite every term's id to match. Shared prefixes stay shared.
-    fn compact<const NW: usize>(&mut self, map: &mut FxHashMap<PauliKey<NW>, Vec<Term>>) {
-        const UNSEEN: u32 = u32::MAX;
-        let mut remap = vec![UNSEEN; self.nodes.len()];
-        remap[ROOT as usize] = ROOT;
-        let mut kept = vec![self.nodes[ROOT as usize]];
-        let mut chain: Vec<u32> = Vec::new();
-        for terms in map.values_mut() {
-            for term in terms.iter_mut() {
-                let mut id = term.mono;
-                while remap[id as usize] == UNSEEN {
-                    chain.push(id);
-                    id = self.nodes[id as usize].parent;
-                }
-                while let Some(old) = chain.pop() {
-                    let node = self.nodes[old as usize];
-                    remap[old as usize] = kept.len() as u32;
-                    kept.push(Node {
-                        parent: remap[node.parent as usize],
+/// Rebuild every arena from the nodes the terms in `shards` still reach,
+/// and rewrite each term's reference to match. Nodes keep their arena and
+/// their order, so a live node's new index is the number of live nodes
+/// before it in its arena (its rank), and shared prefixes stay shared.
+/// Each step runs one thread per shard or arena when `parallel`.
+fn compact<const NW: usize>(arenas: &mut [Monomials], shards: &mut [WordMap<NW>], parallel: bool) {
+    // 1. Mark every node some term reaches. A walk stops at the first node
+    // that was already marked; whoever marked it walks the rest of its chain.
+    let marks: Vec<Vec<AtomicU64>> = arenas
+        .iter()
+        .map(|a| {
+            (0..a.len().div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect()
+        })
+        .collect();
+    let mark = |r: MonoRef| -> bool {
+        let (a, i) = split_ref(r);
+        let bit = 1u64 << (i % 64);
+        marks[a][i / 64].fetch_or(bit, Ordering::Relaxed) & bit != 0
+    };
+    mark(ROOT);
+    let old: &[Monomials] = arenas;
+    run_all(shards.iter().collect(), parallel, |shard: &WordMap<NW>| {
+        for term in shard.values().flatten() {
+            let mut id = term.mono;
+            while !mark(id) {
+                id = node_at(old, id).parent;
+            }
+        }
+    });
+
+    // 2. Rank: the number of live nodes before each 64-node block.
+    let live: Vec<Vec<u64>> = marks
+        .into_iter()
+        .map(|bits| bits.into_iter().map(AtomicU64::into_inner).collect())
+        .collect();
+    let block_rank: Vec<Vec<u32>> = live
+        .iter()
+        .map(|bits| {
+            let mut below = 0u32;
+            bits.iter()
+                .map(|b| {
+                    let rank = below;
+                    below += b.count_ones();
+                    rank
+                })
+                .collect()
+        })
+        .collect();
+    let renumber = |r: MonoRef| -> MonoRef {
+        let (a, i) = split_ref(r);
+        let before = live[a][i / 64] & ((1u64 << (i % 64)) - 1);
+        mono_ref(a, (block_rank[a][i / 64] + before.count_ones()) as usize)
+    };
+
+    // 3. Copy each arena's live nodes, in order, with renumbered parents.
+    let kept: Vec<Vec<Node>> = run_all(
+        old.iter().zip(&live).collect(),
+        parallel,
+        |(arena, bits): (&Monomials, &Vec<u64>)| {
+            let n_live = bits.iter().map(|b| b.count_ones() as usize).sum();
+            let mut nodes = Vec::with_capacity(n_live);
+            for (w, &word) in bits.iter().enumerate() {
+                let mut b = word;
+                while b != 0 {
+                    let node = arena.nodes[w * 64 + b.trailing_zeros() as usize];
+                    nodes.push(Node {
+                        parent: renumber(node.parent),
                         ..node
                     });
+                    b &= b - 1;
                 }
-                term.mono = remap[term.mono as usize];
             }
-        }
-        self.nodes = kept;
+            nodes
+        },
+    );
+
+    // 4. Point every term at its node's new reference.
+    run_all(
+        shards.iter_mut().collect(),
+        parallel,
+        |shard: &mut WordMap<NW>| {
+            for term in shard.values_mut().flatten() {
+                term.mono = renumber(term.mono);
+            }
+        },
+    );
+    for (arena, nodes) in arenas.iter_mut().zip(kept) {
+        arena.nodes = nodes;
     }
 }
 
@@ -940,16 +1048,39 @@ fn evolve_controlled_rotation<const NW: usize>(
     }
 }
 
-fn to_expectation<const NW: usize>(map: &FxHashMap<PauliKey<NW>, Vec<Term>>, mono: &Monomials) -> Vec<CoeffTerm> {
-    let mut out = Vec::new();
-    for ((x, _z), terms) in map.iter() {
-        if mask_is_zero(x) {
-            for t in terms {
-                let (s, cc) = mono.to_lists(t);
-                out.push((t.coeff, s, cc));
+/// Order of the terms in a finished expression: by index lists, then by
+/// coefficient.
+fn cmp_terms(a: &CoeffTerm, b: &CoeffTerm) -> std::cmp::Ordering {
+    (&a.1, &a.2)
+        .cmp(&(&b.1, &b.2))
+        .then_with(|| a.0.total_cmp(&b.0))
+}
+
+/// The terms of every word with no X/Y, i.e. with a nonzero expectation in
+/// |0...0>, sorted by `cmp_terms`. Iterating the maps gives an order that
+/// depends on hashing and on how the words were split over threads; sorting
+/// makes the expression the same either way.
+fn to_expectation<const NW: usize>(
+    shards: &[WordMap<NW>],
+    arenas: &[Monomials],
+    parallel: bool,
+) -> Vec<CoeffTerm> {
+    let runs = run_all(shards.iter().collect(), parallel, |shard: &WordMap<NW>| {
+        let mut run = Vec::new();
+        for ((x, _z), terms) in shard.iter() {
+            if mask_is_zero(x) {
+                for t in terms {
+                    let (s, cc) = to_lists(arenas, t);
+                    run.push((t.coeff, s, cc));
+                }
             }
         }
-    }
+        run.sort_unstable_by(cmp_terms);
+        run
+    });
+    let mut out: Vec<CoeffTerm> = runs.into_iter().flatten().collect();
+    // A stable sort finds the per-shard runs and just merges them.
+    out.sort_by(cmp_terms);
     out
 }
 
@@ -1078,14 +1209,169 @@ fn build_layers<const NW: usize>(gate_masks: &[[u64; NW]]) -> Vec<Layer<NW>> {
     layers
 }
 
-/// Propagate one observable backwards through `reversed`.
+/// Everything about the circuit and the truncation settings that stays fixed
+/// for a whole propagation, shared read-only by every thread.
+struct Circuit<'a, const NW: usize> {
+    reversed: &'a [GateSpec<NW>],
+    gate_masks: &'a [[u64; NW]],
+    active_qubits_from: &'a [[u64; NW]],
+    k1: i64,
+    k2: i64,
+    coeff_threshold: f64, // < 0 disables
+    use_dead_qubit_pruner: bool,
+    use_xy_weight_pruner: bool,
+}
+
+/// One layer's pass, as seen by each shard's thread.
+struct LayerPass<'a, const NW: usize> {
+    circuit: &'a Circuit<'a, NW>,
+    layer: &'a Layer<NW>,
+    // Gate owning each qubit in this layer (usize::MAX = none).
+    gate_on_qubit: &'a [usize],
+    // Whether the map still holds the observable's untruncated words.
+    fresh: bool,
+    first_gate: Option<usize>,
+    n_shards: usize,
+}
+
+// Below this many words a layer runs on the calling thread; spawning
+// would cost more than it saves.
+const PARALLEL_MIN_WORDS: usize = 1 << 13;
+
+/// The shard (and so the thread) that owns `key`. The hash is remixed so
+/// the keys within one shard still spread over all of its map's buckets.
+fn shard_of<const NW: usize>(key: &PauliKey<NW>, n_shards: usize) -> usize {
+    if n_shards == 1 {
+        return 0;
+    }
+    let mut h = FxHasher::default();
+    key.hash(&mut h);
+    let mixed = h.finish().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+    ((mixed * n_shards as u64) >> 32) as usize
+}
+
+/// First half of a layer, for one shard: move out the words the layer acts
+/// on, carry each through its gates in circuit order, and batch the results
+/// by the shard that owns them. Also returns the support of the words that
+/// stayed.
+fn evolve_shard<const NW: usize>(
+    pass: &LayerPass<NW>,
+    shard: &mut WordMap<NW>,
+    mono: &mut Monomials,
+) -> (Vec<Emitted<NW>>, [u64; NW]) {
+    let c = pass.circuit;
+    let truncate = |key: &PauliKey<NW>, terms: &mut Vec<Term>| {
+        truncate(key, terms, c.k1, c.k2, c.coeff_threshold)
+    };
+
+    // Each moved-out word comes with the (ascending) indices of the gates
+    // that act on it.
+    let mut acted: Vec<(PauliKey<NW>, Vec<Term>, Vec<usize>)> = Vec::new();
+    let mut stayed_active = [0u64; NW];
+    shard.retain(|key, terms| {
+        let (x, z) = key;
+        let support = mask_or(x, z);
+        let mut gates: Vec<usize> = Vec::new();
+        if mask_intersects(&support, &pass.layer.mask) {
+            for_each_bit(&support, |q| {
+                let g = pass.gate_on_qubit[q];
+                if g != usize::MAX && !gates.contains(&g) && gate_acts(&c.reversed[g], x, z) {
+                    gates.push(g);
+                }
+            });
+        }
+        if !gates.is_empty() {
+            gates.sort_unstable();
+            acted.push((*key, std::mem::take(terms), gates));
+            return false;
+        }
+        if pass.fresh && !truncate(key, terms) {
+            return false;
+        }
+        mask_or_assign(&mut stayed_active, &support);
+        true
+    });
+
+    let mut outgoing: Vec<Emitted<NW>> = (0..pass.n_shards).map(|_| Vec::new()).collect();
+    let mut work: Vec<(PauliKey<NW>, Vec<Term>, usize)> = Vec::new();
+    let mut emitted: Emitted<NW> = Vec::new();
+    for (key, terms, gates) in acted {
+        work.push((key, terms, 0));
+        while let Some((key, mut terms, pos)) = work.pop() {
+            if pos == gates.len() {
+                outgoing[shard_of(&key, pass.n_shards)].push((key, terms));
+                continue;
+            }
+            let g = gates[pos];
+            if pass.fresh && pos == 0 && pass.first_gate != Some(g) {
+                // An observable word the first gate step left alone: it
+                // was truncated along with everything else after it.
+                if !truncate(&key, &mut terms) {
+                    continue;
+                }
+            }
+            // DeadQubitPruner: word is dead if it has X/Y (x-bit set) on a
+            // qubit that no remaining gate (incl. this one) touches again.
+            if c.use_dead_qubit_pruner && !mask_subset(&key.0, &c.active_qubits_from[g]) {
+                continue;
+            }
+            if c.use_xy_weight_pruner && !xy_reachable(&key.0, &c.gate_masks[g..]) {
+                continue;
+            }
+            evolve_one_gate(&c.reversed[g], key.0, key.1, terms, mono, &mut emitted);
+            for (out_key, mut out_terms) in emitted.drain(..) {
+                if truncate(&out_key, &mut out_terms) {
+                    work.push((out_key, out_terms, pos + 1));
+                }
+            }
+        }
+    }
+    (outgoing, stayed_active)
+}
+
+/// Second half of a layer, for one shard: merge in the words every shard
+/// produced for it. Returns their support.
+fn merge_shard<const NW: usize>(shard: &mut WordMap<NW>, incoming: Vec<Emitted<NW>>) -> [u64; NW] {
+    let mut active = [0u64; NW];
+    for batch in incoming {
+        for (key, terms) in batch {
+            mask_or_assign(&mut active, &key.0);
+            mask_or_assign(&mut active, &key.1);
+            insert_or_extend(shard, key, terms);
+        }
+    }
+    active
+}
+
+/// `f` applied to every item, on one scoped thread per item when `parallel`,
+/// with the results in item order.
+fn run_all<T: Send, R: Send>(items: Vec<T>, parallel: bool, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    if !parallel {
+        return items.into_iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|item| s.spawn(move || f(item)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
+/// Propagate one observable backwards through the circuit.
 ///
-/// The map is updated in place, one layer (see `Layer`) at a time. A single
-/// pass over the map moves out the words some gate in the layer acts on and
-/// leaves every other word where it is. Each moved-out word is then carried
-/// through the gates that act on it, in circuit order, and whatever comes out
-/// is merged back in. The result is the same as applying one gate at a time
-/// to the whole map, with pruning and truncation after every gate:
+/// The words are split over `shards` by `shard_of`, one shard per thread,
+/// and every thread appends to its own monomial arena. Each layer (see
+/// `Layer`) is one pass: every shard moves out the words some gate in the
+/// layer acts on, leaving the rest where they are; each moved-out word is
+/// carried through the gates that act on it, in circuit order; and the
+/// results are merged into whichever shard owns them. The result is the same
+/// as applying one gate at a time to the whole map, with pruning and
+/// truncation after every gate:
 ///
 /// * Truncation (k1/k2/coefficient) depends only on a word's key and terms,
 ///   so it only has to run when a gate produces a word. The observable's own
@@ -1098,38 +1384,27 @@ fn build_layers<const NW: usize>(gate_masks: &[[u64; NW]]) -> Vec<Layer<NW>> {
 ///   gate is about to act on it, which rejects it exactly when some earlier
 ///   check would have. A dead word that no gate touches again just sits in
 ///   the map; it has an X/Y somewhere, so it never reaches the expectation.
-#[allow(clippy::too_many_arguments)]
 fn heisenberg_one<const NW: usize>(
-    reversed: &[GateSpec<NW>],
-    gate_masks: &[[u64; NW]],
+    circuit: &Circuit<NW>,
     layers: &[Layer<NW>],
-    active_qubits_from: &[[u64; NW]],
-    mut map: FxHashMap<PauliKey<NW>, Vec<Term>>,
-    mono: &mut Monomials,
-    k1: i64,
-    k2: i64,
-    coeff_threshold: f64, // < 0 disables
-    use_dead_qubit_pruner: bool,
-    use_xy_weight_pruner: bool,
+    mut shards: Vec<WordMap<NW>>,
+    arenas: &mut [Monomials],
 ) -> Vec<CoeffTerm> {
+    let n_shards = shards.len();
     let mut active_mask = [0u64; NW];
-    for (x, z) in map.keys() {
+    for (x, z) in shards.iter().flat_map(|s| s.keys()) {
         mask_or_assign(&mut active_mask, x);
         mask_or_assign(&mut active_mask, z);
     }
     // The first gate the one-gate-at-a-time loop would not skip. Until it
     // has been applied, the observable's own words are untruncated.
-    let first_gate = gate_masks
+    let first_gate = circuit
+        .gate_masks
         .iter()
         .position(|gm| mask_intersects(gm, &active_mask));
 
-    // Gate owning each qubit in the current layer (usize::MAX = none).
     let mut gate_on_qubit = vec![usize::MAX; NW * 64];
-    let mut acted: Vec<(PauliKey<NW>, Vec<Term>, Vec<usize>)> = Vec::new();
-    let mut work: Vec<(PauliKey<NW>, Vec<Term>, usize)> = Vec::new();
-    let mut emitted: Emitted<NW> = Vec::new();
-    let mut done: Emitted<NW> = Vec::new();
-    let mut compact_at = MIN_COMPACT_NODES.max(4 * mono.len());
+    let mut compact_at = MIN_COMPACT_NODES;
     let mut started = false;
 
     for layer in layers {
@@ -1139,87 +1414,56 @@ fn heisenberg_one<const NW: usize>(
         // Only the first layer processed still holds untruncated words.
         let fresh = !started;
         started = true;
-        let layer_masks = &gate_masks[layer.start..layer.end];
+        let layer_masks = &circuit.gate_masks[layer.start..layer.end];
         for (g, gm) in (layer.start..).zip(layer_masks) {
             for_each_bit(gm, |q| gate_on_qubit[q] = g);
         }
 
-        // Pull out the words this layer acts on, each with the (ascending)
-        // indices of the gates that act on it.
+        let n_words: usize = shards.iter().map(|s| s.len()).sum();
+        let parallel = n_shards > 1 && n_words >= PARALLEL_MIN_WORDS;
+        let pass = LayerPass {
+            circuit,
+            layer,
+            gate_on_qubit: &gate_on_qubit,
+            fresh,
+            first_gate,
+            n_shards,
+        };
+        let evolved = run_all(
+            shards.iter_mut().zip(arenas.iter_mut()).collect(),
+            parallel,
+            |(shard, mono)| evolve_shard(&pass, shard, mono),
+        );
         let mut next_active = [0u64; NW];
-        map.retain(|key, terms| {
-            let (x, z) = key;
-            let support = mask_or(x, z);
-            let mut gates: Vec<usize> = Vec::new();
-            if mask_intersects(&support, &layer.mask) {
-                for_each_bit(&support, |q| {
-                    let g = gate_on_qubit[q];
-                    if g != usize::MAX && !gates.contains(&g) && gate_acts(&reversed[g], x, z) {
-                        gates.push(g);
-                    }
-                });
-            }
-            if !gates.is_empty() {
-                gates.sort_unstable();
-                acted.push((*key, std::mem::take(terms), gates));
-                return false;
-            }
-            if fresh && !truncate(key, terms, k1, k2, coeff_threshold) {
-                return false;
-            }
-            mask_or_assign(&mut next_active, &support);
-            true
-        });
-
-        for (key, terms, gates) in acted.drain(..) {
-            work.push((key, terms, 0));
-            while let Some((key, mut terms, pos)) = work.pop() {
-                if pos == gates.len() {
-                    done.push((key, terms));
-                    continue;
-                }
-                let g = gates[pos];
-                if fresh && first_gate != Some(g) && pos == 0 {
-                    // An observable word the first gate step left alone: it
-                    // was truncated along with everything else after it.
-                    if !truncate(&key, &mut terms, k1, k2, coeff_threshold) {
-                        continue;
-                    }
-                }
-                // DeadQubitPruner: word is dead if it has X/Y (x-bit set) on a
-                // qubit that no remaining gate (incl. this one) touches again.
-                if use_dead_qubit_pruner && !mask_subset(&key.0, &active_qubits_from[g]) {
-                    continue;
-                }
-                if use_xy_weight_pruner && !xy_reachable(&key.0, &gate_masks[g..]) {
-                    continue;
-                }
-                evolve_one_gate(&reversed[g], key.0, key.1, terms, mono, &mut emitted);
-                for (out_key, mut out_terms) in emitted.drain(..) {
-                    if truncate(&out_key, &mut out_terms, k1, k2, coeff_threshold) {
-                        work.push((out_key, out_terms, pos + 1));
-                    }
-                }
+        let mut incoming: Vec<Vec<Emitted<NW>>> = (0..n_shards).map(|_| Vec::new()).collect();
+        for (outgoing, stayed_active) in evolved {
+            mask_or_assign(&mut next_active, &stayed_active);
+            for (dest, batch) in outgoing.into_iter().enumerate() {
+                incoming[dest].push(batch);
             }
         }
-
-        for (key, terms) in done.drain(..) {
-            mask_or_assign(&mut next_active, &key.0);
-            mask_or_assign(&mut next_active, &key.1);
-            insert_or_extend(&mut map, key, terms);
+        let merged = run_all(
+            shards.iter_mut().zip(incoming).collect(),
+            parallel,
+            |(shard, batches)| merge_shard(shard, batches),
+        );
+        for mask in &merged {
+            mask_or_assign(&mut next_active, mask);
         }
         active_mask = next_active;
 
         for gm in layer_masks {
             for_each_bit(gm, |q| gate_on_qubit[q] = usize::MAX);
         }
-        if mono.len() >= compact_at {
-            mono.compact(&mut map);
-            compact_at = MIN_COMPACT_NODES.max(4 * mono.len());
+        let n_nodes: usize = arenas.iter().map(|a| a.len()).sum();
+        if n_nodes >= compact_at || arenas.iter().any(|a| a.len() >= ARENA_CAPACITY / 2) {
+            compact(arenas, &mut shards, n_shards > 1);
+            let n_nodes: usize = arenas.iter().map(|a| a.len()).sum();
+            compact_at = MIN_COMPACT_NODES.max(4 * n_nodes);
         }
     }
 
-    to_expectation(&map, mono)
+    to_expectation(&shards, arenas, n_shards > 1)
 }
 
 /// Call `f` with the index of every set bit in `mask`, lowest first.
@@ -1247,6 +1491,7 @@ fn propagate_batch_impl<const NW: usize>(
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
     paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
+    n_threads: usize,
 ) -> PyResult<Vec<Vec<CoeffTerm>>> {
     let n_gates = gate_kind.len();
     let mut gates: Vec<GateSpec<NW>> = Vec::with_capacity(n_gates);
@@ -1278,20 +1523,31 @@ fn propagate_batch_impl<const NW: usize>(
         active_qubits_from[i] = mask_or(&active_qubits_from[i + 1], &reversed[i].wire_mask);
     }
 
+    let circuit = Circuit {
+        reversed: &reversed,
+        gate_masks: &gate_masks,
+        active_qubits_from: &active_qubits_from,
+        k1,
+        k2,
+        coeff_threshold,
+        use_dead_qubit_pruner,
+        use_xy_weight_pruner,
+    };
+    let n_shards = n_threads.clamp(1, MAX_ARENAS);
+
     let mut results = Vec::with_capacity(paulidicts.len());
     for pd_spec in paulidicts {
-        let mut mono = Monomials::new();
-        let mut map: FxHashMap<PauliKey<NW>, Vec<Term>> = FxHashMap::default();
+        let mut arenas: Vec<Monomials> = (0..n_shards).map(Monomials::new).collect();
+        let mut shards: Vec<WordMap<NW>> = (0..n_shards).map(|_| WordMap::default()).collect();
         for (xw, zw, coeff, sin_idx, cos_idx) in pd_spec {
             let key = (words_to_array::<NW>(&xw), words_to_array::<NW>(&zw));
-            let term = mono.term_from_lists(coeff, &sin_idx, &cos_idx);
-            map.entry(key).or_default().push(term);
+            let term = arenas[0].term_from_lists(coeff, &sin_idx, &cos_idx);
+            shards[shard_of(&key, n_shards)]
+                .entry(key)
+                .or_default()
+                .push(term);
         }
-        let expr = heisenberg_one(
-            &reversed, &gate_masks, &layers, &active_qubits_from, map, &mut mono,
-            k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
-        );
-        results.push(expr);
+        results.push(heisenberg_one(&circuit, &layers, shards, &mut arenas));
     }
 
     Ok(results)
@@ -1335,9 +1591,11 @@ macro_rules! dispatch_nw {
     k1, k2, coeff_threshold,
     use_dead_qubit_pruner, use_xy_weight_pruner,
     paulidicts,
+    n_threads = 1,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn propagate_batch(
+    py: Python<'_>,
     num_qubits: u32,
     gate_kind: Vec<u8>,
     gate_wire0: Vec<u32>,
@@ -1350,16 +1608,19 @@ fn propagate_batch(
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
     paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
+    n_threads: usize,
 ) -> PyResult<Vec<Vec<(f64, Vec<u32>, Vec<u32>)>>> {
     let nw = words_needed(num_qubits);
-    dispatch_nw!(
-        nw, num_qubits, propagate_batch_impl,
-        (
-            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
-            k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
-            paulidicts,
+    py.allow_threads(move || {
+        dispatch_nw!(
+            nw, num_qubits, propagate_batch_impl,
+            (
+                gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
+                k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
+                paulidicts, n_threads,
+            )
         )
-    )
+    })
 }
 
 fn evolve_single_gate_debug_impl<const NW: usize>(
@@ -1378,14 +1639,14 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
         set_wire_bit(&mut wire_mask, wire1 as u32);
     }
     let gate = GateSpec::<NW> { kind, wire0, wire1, param, fixed, wire_mask };
-    let mut mono = Monomials::new();
+    let mut mono = Monomials::new(0);
     let terms: Vec<Term> = terms.iter().map(|(c, s, cc)| mono.term_from_lists(*c, s, cc)).collect();
     let mut out: Emitted<NW> = Vec::new();
     evolve_one_gate(&gate, words_to_array::<NW>(x), words_to_array::<NW>(z), terms, &mut mono, &mut out);
     let mut rows = Vec::new();
     for ((ox, oz), terms) in out {
         for t in terms {
-            let (s, cc) = mono.to_lists(&t);
+            let (s, cc) = to_lists(std::slice::from_ref(&mono), &t);
             rows.push((ox.to_vec(), oz.to_vec(), t.coeff, s, cc));
         }
     }
@@ -1419,6 +1680,47 @@ fn evolve_single_gate_debug(
         nw, num_qubits, evolve_single_gate_debug_impl,
         (kind, wire0, wire1, param, fixed, &x, &z, terms)
     ))
+}
+
+/// The CSR layout `pprop.propagator.evaluator.build_ragged_arrays` builds
+/// (coefficients, lookup-table index of every factor, factors per term), as
+/// native-endian float64/int64 buffers for `numpy.frombuffer`. Same layout,
+/// entry for entry; this just skips the per-factor Python loop.
+#[pyfunction]
+fn ragged_layout<'py>(
+    py: Python<'py>,
+    expr: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    num_params: u32,
+) -> (
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+) {
+    let sentinel = num_params as i64;
+    let cos_offset = num_params as i64 + 1;
+    let mut coeffs: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut cnt: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut idx: Vec<u8> = Vec::new();
+    for (coeff, sin_idx, cos_idx) in &expr {
+        coeffs.extend_from_slice(&coeff.to_ne_bytes());
+        for &j in sin_idx {
+            idx.extend_from_slice(&(j as i64).to_ne_bytes());
+        }
+        for &j in cos_idx {
+            idx.extend_from_slice(&(cos_offset + j as i64).to_ne_bytes());
+        }
+        let mut n = (sin_idx.len() + cos_idx.len()) as i64;
+        if n == 0 {
+            idx.extend_from_slice(&sentinel.to_ne_bytes());
+            n = 1;
+        }
+        cnt.extend_from_slice(&n.to_ne_bytes());
+    }
+    (
+        PyByteArray::new_bound(py, &coeffs),
+        PyByteArray::new_bound(py, &idx),
+        PyByteArray::new_bound(py, &cnt),
+    )
 }
 
 /// Add `term` to the accumulator slot of every factor in `run`, spreading
@@ -1695,52 +1997,11 @@ fn read_u32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     PyBuffer::<u32>::get_bound(obj)?.to_vec(obj.py())
 }
 
-/// The CSR layout `pprop.propagator.evaluator.build_ragged_arrays` builds
-/// (coefficients, lookup-table index of every factor, factors per term), as
-/// native-endian float64/int64 buffers for `numpy.frombuffer`. Same layout,
-/// entry for entry; this just skips the per-factor Python loop.
-#[pyfunction]
-fn ragged_layout<'py>(
-    py: Python<'py>,
-    expr: Vec<(f64, Vec<u32>, Vec<u32>)>,
-    num_params: u32,
-) -> (
-    Bound<'py, PyByteArray>,
-    Bound<'py, PyByteArray>,
-    Bound<'py, PyByteArray>,
-) {
-    let sentinel = num_params as i64;
-    let cos_offset = num_params as i64 + 1;
-    let mut coeffs: Vec<u8> = Vec::with_capacity(8 * expr.len());
-    let mut cnt: Vec<u8> = Vec::with_capacity(8 * expr.len());
-    let mut idx: Vec<u8> = Vec::new();
-    for (coeff, sin_idx, cos_idx) in &expr {
-        coeffs.extend_from_slice(&coeff.to_ne_bytes());
-        for &j in sin_idx {
-            idx.extend_from_slice(&(j as i64).to_ne_bytes());
-        }
-        for &j in cos_idx {
-            idx.extend_from_slice(&(cos_offset + j as i64).to_ne_bytes());
-        }
-        let mut n = (sin_idx.len() + cos_idx.len()) as i64;
-        if n == 0 {
-            idx.extend_from_slice(&sentinel.to_ne_bytes());
-            n = 1;
-        }
-        cnt.extend_from_slice(&n.to_ne_bytes());
-    }
-    (
-        PyByteArray::new_bound(py, &coeffs),
-        PyByteArray::new_bound(py, &idx),
-        PyByteArray::new_bound(py, &cnt),
-    )
-}
-
 #[pymodule]
 fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(propagate_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
-    m.add_class::<Evaluator>()?;
     m.add_function(wrap_pyfunction!(ragged_layout, m)?)?;
+    m.add_class::<Evaluator>()?;
+    m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
     Ok(())
 }

@@ -256,6 +256,7 @@ class Propagator:
         use_xy_weight_pruner: bool = False,
         coeff_threshold: Optional[float] = None,
         eval_n_jobs: int = 1,
+        n_threads: int = -1,
     ):
         """
         Propagate each observable backwards through the circuit (Heisenberg picture).
@@ -308,6 +309,11 @@ class Propagator:
             observable's evaluation is typically too cheap for threading to
             pay off). Pass ``-1`` to use all available cores (respecting a
             cgroup/SLURM allocation via ``os.sched_getaffinity``).
+        n_threads : int, optional
+            Number of threads the propagation itself runs on. Defaults to
+            ``-1``: every CPU this process may use (respecting a cgroup/SLURM
+            allocation, like ``eval_n_jobs``), up to 32. The expression is
+            identical for every thread count.
         """
         if self._propagated:
             print("Already propagated")
@@ -317,6 +323,10 @@ class Propagator:
             eval_n_jobs = _available_cpus()
         elif eval_n_jobs < 1:
             raise ValueError(f"eval_n_jobs must be -1 or a positive integer, got {eval_n_jobs}")
+        if n_threads == -1:
+            n_threads = _available_cpus()
+        elif n_threads < 1:
+            raise ValueError(f"n_threads must be -1 or a positive integer, got {n_threads}")
 
         gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed = [], [], [], [], []
         for g in self.gates:
@@ -374,6 +384,7 @@ class Propagator:
                 coeff_threshold if coeff_threshold is not None else -1.0,
                 use_dead_qubit_pruner, use_xy_weight_pruner,
                 rust_paulidicts,
+                n_threads,
             )
         finally:
             if gc_was_enabled:
