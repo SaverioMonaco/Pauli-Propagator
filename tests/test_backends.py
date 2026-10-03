@@ -16,7 +16,6 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
-from pprop.propagator.evaluator import build_ragged_arrays
 
 num_qubits = 3
 
@@ -296,10 +295,10 @@ def test_propagator_beyond_64_qubits():
 
 def test_fixed_value_gates_agree_with_qml():
     """
-    A fixed-value gate gets a hidden slot rather than a trainable index, and
-    the ragged layout indexes that slot out of the same lookup table as every
-    other factor. Value and gradient must still match param-shift, and the
-    gradient must carry one column per *trainable* parameter, not per slot.
+    A fixed-value gate is folded into the coefficients during propagation, so
+    the expression only ever references trainable indices. Value and gradient
+    must still match param-shift, and the gradient must carry one column per
+    trainable parameter.
     """
     def ansatz(params):
         for layer in range(2):
@@ -315,13 +314,12 @@ def test_fixed_value_gates_agree_with_qml():
 
     prop = Propagator(ansatz)
     prop.propagate()
-    assert prop._fixed_value_slots  # RY(pi) got a hidden slot
-    assert prop._internal_num_params > prop.num_params
-
-    # The hidden slot is a real entry in the ragged table, so the expression
-    # references more parameters than the caller ever passes in.
-    _, idx, _ = build_ragged_arrays(prop.exprs[0], prop._internal_num_params)
-    assert idx.size
+    assert prop.num_params == 12
+    assert prop.exprs[0], "expected a non-empty expression"
+    referenced = {i for _, s, c in prop.exprs[0] for i in (*s, *c)}
+    assert referenced and max(referenced) < prop.num_params, (
+        f"folded expression still references a non-trainable index: {referenced}"
+    )
 
     qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=num_qubits))
     for _ in range(3):
@@ -404,6 +402,111 @@ def test_repeated_parameter_powers_agree_with_qml():
         )
 
 
+def test_fixed_rotation_at_quarter_turn_kills_its_branch():
+    """
+    A fixed RX(pi) has sin(pi) = 0 exactly (after snapping the 1.2e-16 that
+    float64 actually returns), so the branch it would open must not exist:
+    the constant goes into the coefficient the way qml.T's 1/sqrt(2) does,
+    and the term count is what it would be without the gate.
+    """
+    def ansatz(params):
+        qml.RY(params[0], wires=0)
+        qml.RX(np.pi, wires=0)
+        qml.T(wires=0)
+        return qml.expval(qml.PauliY(0))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    # Exactly one term, 1/sqrt(2) * sin(theta0), and no float-noise cos term.
+    assert len(prop.exprs[0]) == 1, prop.exprs[0]
+    coeff, sin_idx, cos_idx = prop.exprs[0][0]
+    assert (sin_idx, cos_idx) == ([0], [])
+    assert np.isclose(abs(coeff), 1 / np.sqrt(2))
+
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=1))
+    for theta in (0.0, 0.3, 1.0, -2.5):
+        assert np.isclose(prop(np.array([theta]))[0], float(qnode(np.array([theta]))), atol=1e-10)
+
+
+def test_fixed_value_controlled_rotations_agree_with_qml():
+    """
+    Controlled rotations' rule tables are written in theta/2, and a trainable
+    CR relies on the caller halving its entry at eval time (see the note in
+    controlledrotation.py). A fixed angle never went through that halving, so
+    a fixed CRX(pi) used to evaluate with sin(pi)/cos(pi) instead of
+    sin(pi/2)/cos(pi/2) and came out as a constant. Folding at propagation
+    time applies each gate's own convention, so pin every CR gate at angles
+    on and off the quarter-turn grid against default.qubit. The trainable
+    single-qubit gates around it make sure the *gradient* is right too.
+    """
+    angles = (np.pi, np.pi / 2, 3 * np.pi / 2, 0.3, 2.4)
+    for cr_gate in (qml.CRX, qml.CRY, qml.CRZ):
+        for angle in angles:
+            def ansatz(params):
+                qml.RX(params[0], wires=0)
+                qml.RY(params[1], wires=1)
+                cr_gate(angle, wires=[0, 1])
+                qml.RX(params[2], wires=1)
+                return [qml.expval(qml.PauliZ(1)), qml.expval(qml.PauliX(1))]
+
+            prop = Propagator(ansatz)
+            prop.propagate()
+            assert prop.num_params == 3
+            qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=2))
+            rng = np.random.default_rng(1)
+            for _ in range(2):
+                values = rng.uniform(-np.pi, np.pi, 3)
+                params = qml.numpy.array(values, requires_grad=True)
+                val, grad = prop.eval_and_grad(values)
+                assert np.allclose(val, qnode(params), atol=1e-8), (cr_gate.__name__, angle, val, qnode(params))
+                assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6), (cr_gate.__name__, angle)
+
+
+def test_fixed_value_shared_between_rotation_and_controlled_rotation():
+    """
+    A fixed RX(pi) and a fixed CRX(pi) in one circuit need sin(pi) for one
+    gate and sin(pi/2) for the other. The old slot-per-value scheme could not
+    represent that (both mapped to the same hidden slot); per-gate folding can.
+    """
+    def ansatz(params):
+        qml.RY(params[0], wires=0)
+        qml.RX(np.pi, wires=1)
+        qml.Hadamard(wires=1)
+        qml.CRX(np.pi, wires=[0, 1])
+        qml.RY(params[1], wires=1)
+        return [qml.expval(qml.PauliZ(1)), qml.expval(qml.PauliX(1) @ qml.PauliZ(0))]
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    qnode = qml.QNode(ansatz, qml.device("default.qubit", wires=2))
+    rng = np.random.default_rng(2)
+    for _ in range(3):
+        values = rng.uniform(-np.pi, np.pi, 2)
+        params = qml.numpy.array(values, requires_grad=True)
+        val, grad = prop.eval_and_grad(values)
+        assert np.allclose(val, qnode(params), atol=1e-8)
+        assert np.allclose(grad, qml.gradients.param_shift(qnode)(params), atol=1e-6)
+
+
+def test_fixed_value_gates_do_not_count_towards_k2():
+    """
+    k2 bounds the number of trigonometric factors per term. A fixed-angle
+    gate contributes a constant, not a factor, so, like qml.T, it must not
+    push a term over the cutoff. Here the exact answer is cos(0.3)*cos(theta0):
+    one trigonometric factor, so k2=1 must keep it.
+    """
+    def ansatz(params):
+        qml.RX(params[0], wires=0)
+        qml.RY(0.3, wires=0)
+        return qml.expval(qml.PauliZ(0))
+
+    prop = Propagator(ansatz, k2=1)
+    prop.propagate()
+    assert len(prop.exprs[0]) == 1, prop.exprs[0]
+    for theta in (0.0, 0.7, 2.0):
+        assert np.isclose(prop(np.array([theta]))[0], np.cos(0.3) * np.cos(theta), atol=1e-12)
+
+
 # %%
 test_propagator_agrees_with_qml()
 test_eval_n_jobs_matches_single_threaded()
@@ -414,6 +517,35 @@ test_propagator_beyond_64_qubits()
 test_fixed_value_gates_agree_with_qml()
 test_gradient_at_zeros_of_sin_and_cos()
 test_repeated_parameter_powers_agree_with_qml()
+test_fixed_rotation_at_quarter_turn_kills_its_branch()
+test_fixed_value_controlled_rotations_agree_with_qml()
+test_fixed_value_shared_between_rotation_and_controlled_rotation()
+test_fixed_value_gates_do_not_count_towards_k2()
+
+
+@pytest.mark.parametrize("angle", [5e-13, -5e-13, 2e-12, -2e-12])
+def test_fixed_angle_snap_boundary_and_coefficient_scale(angle):
+    """The snap is a per-factor approximation, not an absolute error bound."""
+    scale, theta = 1e12, 0.7
+
+    def ansatz(params):
+        qml.RY(params[0], wires=0)
+        qml.RY(angle, wires=0)
+        return qml.expval(scale * qml.PauliZ(0))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    value, grad = prop.eval_and_grad(np.array([theta]))
+    if abs(np.sin(angle)) < 1e-12:
+        assert len(prop.exprs[0]) == 1
+        assert value[0] == pytest.approx(scale * np.cos(theta), abs=1e-3, rel=0)
+        assert grad[0, 0] == pytest.approx(-scale * np.sin(theta), abs=1e-3, rel=0)
+        error = abs(value[0] - scale * np.cos(theta + angle))
+        assert 0.1 < error < scale * 1e-12
+    else:
+        assert len(prop.exprs[0]) == 2
+        assert value[0] == pytest.approx(scale * np.cos(theta + angle), abs=1e-3, rel=0)
+        assert grad[0, 0] == pytest.approx(-scale * np.sin(theta + angle), abs=1e-3, rel=0)
 
 
 def _uneven_width_ansatz(params):

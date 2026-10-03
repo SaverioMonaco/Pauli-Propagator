@@ -6,7 +6,9 @@ used by ``scripts/vqe`` and by the pruning section of
 ``notebooks/extra/new_stuff.ipynb``. Two variants are measured:
 
   plain              the ansatz as written
-  fixed-value layer  with a non-parametrised RY(pi) layer
+  fixed-value layer  with a non-parametrised RY(pi) layer, whose constant
+                     angle is folded into the coefficients at propagation
+                     time, so it should cost the same as ``plain``
 
 The baseline is loaded from a git ref rather than pasted in here, so the
 comparison always reflects the repository's own history.
@@ -16,51 +18,52 @@ comparison always reflects the repository's own history.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import subprocess
 import sys
-import tempfile
 import time
+import types
 
 import numpy as np
 import pennylane as qml
 
 from pprop import Propagator
-from pprop.propagator import evaluator
+try:
+    from pprop.propagator import evaluator
+except ImportError:  # revisions before the evaluator moved into its own module
+    from pprop.propagator import utils as evaluator
 
 
-def load_baseline(ref: str = "main"):
+def load_baseline(ref: str = "0511b27"):
     """
-    Load the evaluator as it exists at ``ref`` (default ``main``), so the
+    Load the evaluator as it exists at ``ref`` (default ``0511b27``), so the
     comparison baseline comes from this repository's own history rather than
     from a copy pasted in here.
 
     Returns ``None`` if ``ref`` doesn't resolve or has no evaluator.
     """
-    try:
-        src = subprocess.run(
-            ["git", "show", f"{ref}:src/pprop/propagator/utils.py"],
-            capture_output=True, text=True, check=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-    # Loaded standalone, so the package-relative import has to be absolute.
-    src = src.replace("from ..pauli.sentence import", "from pprop.pauli.sentence import")
-
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
-        fh.write(src)
-        path = fh.name
-
-    name = "pprop_baseline_utils"
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception as exc:
-        print(f"  (baseline {ref} did not load: {exc})")
-        return None
-    return mod if hasattr(mod, "make_sparse_evaluator") else None
+    for filename in ("evaluator.py", "utils.py"):
+        try:
+            src = subprocess.run(
+                ["git", "show", f"{ref}:src/pprop/propagator/{filename}"],
+                capture_output=True, text=True, check=True).stdout
+        except subprocess.CalledProcessError:
+            continue
+        except FileNotFoundError:
+            return None
+        # Load without a temporary file. This comparison isolates evaluator
+        # arithmetic on the SAME expression, using the installed extension.
+        src = src.replace("from ..pauli.sentence import", "from pprop.pauli.sentence import")
+        name = "pprop_baseline_evaluator"
+        mod = types.ModuleType(name)
+        sys.modules[name] = mod
+        try:
+            exec(compile(src, f"{ref}:{filename}", "exec"), mod.__dict__)
+        except Exception as exc:
+            print(f"  (baseline {ref} did not load: {exc})")
+            return None
+        if hasattr(mod, "make_sparse_evaluator"):
+            return mod
+    return None
 
 
 def hamiltonian(side: int, J: float = 1.0, h: float = 1.0) -> qml.Hamiltonian:
@@ -139,11 +142,9 @@ def main() -> None:
         prop = Propagator(make_circuit(a.side, a.layers, fixed))
         prop.propagate(use_dead_qubit_pruner=True, use_xy_weight_pruner=True)
         expr = prop.exprs[0]
-        ip = prop._internal_num_params
+        ip = prop.num_params
 
         theta = rng.uniform(-np.pi, np.pi, ip)
-        for value, slot in prop._fixed_value_slots.items():
-            theta[slot] = value
         sins, coss = np.sin(theta), np.cos(theta)
 
         _, eg_new = evaluator.make_sparse_evaluator(expr, ip)
@@ -155,10 +156,6 @@ def main() -> None:
             t_base = bench(eg_base, (sins, coss), a.repeats)
             v_b, g_b = eg_base(sins, coss)
             v_n, g_n = eg_new(sins, coss)
-            # Only the trainable range is meaningful: Propagator.eval_and_grad
-            # slices the gradient to [:num_params] before the caller sees it.
-            t_ = prop.num_params
-            g_b, g_n = g_b[:t_], g_n[:t_]
             print(f"  {a.baseline:<14} : {t_base:8.2f} ms")
             print(f"  this branch    : {t_new:8.2f} ms   ({t_base / t_new:.1f}x)")
             print(f"  agreement      : value "

@@ -24,7 +24,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
-from numpy import arange, array, cos, empty, integer, ndarray, sin
+from numpy import arange, array, asarray, cos, integer, ndarray, sin
 from pennylane import draw
 from pennylane.tape import QuantumTape
 
@@ -138,7 +138,9 @@ class Propagator:
         Number of trainable parameters, inferred as ``max(parameter_indices) + 1``
         over gates given an int/``np.integer`` parameter. Gates given a plain
         float parameter (e.g. ``qml.RY(0.3, wires=q)``) are fixed, non-trainable
-        values and don't count towards this: see :attr:`_fixed_value_slots`.
+        values and don't count towards this: their ``sin``/``cos`` are folded
+        into the coefficients during propagation, exactly like the constant
+        phases of ``qml.T``, so they never appear in :attr:`exprs` at all.
     k1 : int or None
         Pauli weight cutoff passed to the propagation routine.
     k2 : int or None
@@ -157,15 +159,6 @@ class Propagator:
         Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> (float, ndarray)`` returning value and gradient for
         each observable, with ``sins``/``coss`` as above.
-    _fixed_value_slots : dict[float, int]
-        Maps each distinct fixed gate value to a hidden slot index right
-        after the trainable range ``[0, num_params)``. Populated once in
-        :meth:`__init__`; empty (and free of overhead) for circuits with no
-        fixed-value gates.
-    _internal_num_params : int
-        ``num_params`` plus the number of distinct fixed values, i.e. the
-        width of the padded array :meth:`_full_params` builds before every
-        ``sin``/``cos`` evaluation.
     _propagated : bool
         Internal flag; ``True`` after :meth:`propagate` has been called
         successfully. Guards methods decorated with :func:`~.utils.requires_propagation`.
@@ -250,21 +243,6 @@ class Propagator:
         ]
         self.num_params : int = max(index_params) + 1 if index_params else 0
 
-        # Fixed-value gates don't get a user-facing slot in `num_params`;
-        # instead each *distinct* fixed value is assigned its own hidden slot
-        # right after the real trainable indices, so it can still flow through
-        # the same sin(theta)/cos(theta) machinery as everything else.
-        # `_full_params` splices these constants in before every evaluation.
-        self._fixed_value_slots : dict = {}
-        next_slot = self.num_params
-        for g in self.gates:
-            if g.parameter is not None and not isinstance(g.parameter, (int, integer)):
-                value = float(g.parameter)
-                if value not in self._fixed_value_slots:
-                    self._fixed_value_slots[value] = next_slot
-                    next_slot += 1
-        self._internal_num_params : int = next_slot
-
         # Guards __call__ and eval_and_grad until propagate() has been run.
         self._propagated : bool = False
 
@@ -290,6 +268,21 @@ class Propagator:
         gathered-array representation; see ``evaluator.make_sparse_evaluator``).
         Idempotent: calling this again after a successful call is a no-op
         (prints a notice and returns).
+
+        Notes
+        -----
+        Fixed rotations are folded into coefficients using each gate's angle
+        convention. Sine/cosine factors smaller than ``1e-12`` in magnitude
+        are snapped to zero, including genuinely small nonzero factors. This
+        approximation removes floating-point remnants at quarter turns; it
+        also changes circuits containing rotations very close to those turns.
+        The error scales with the affected coefficients: snapping one factor
+        can change a term by up to ``abs(coeff) * 1e-12``, before accumulation
+        over terms and gates. There is no circuit-wide absolute error bound.
+        Large observable coefficients can therefore amplify the error.
+
+        Fixed gates no longer contribute trigonometric factors toward ``k2``.
+        Results under frequency truncation can differ from earlier revisions.
 
         Parameters
         ----------
@@ -324,7 +317,7 @@ class Propagator:
         elif eval_n_jobs < 1:
             raise ValueError(f"eval_n_jobs must be -1 or a positive integer, got {eval_n_jobs}")
 
-        gate_kind, gate_wire0, gate_wire1, gate_param = [], [], [], []
+        gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed = [], [], [], [], []
         for g in self.gates:
             name = g.qml_gate.name
             if name not in _GATE_KIND:
@@ -337,13 +330,17 @@ class Propagator:
             gate_wire1.append(int(g.wires[1]) if len(g.wires) > 1 else -1)
             if g.parameter is None:
                 gate_param.append(-1)
+                gate_fixed.append(None)
             elif isinstance(g.parameter, (int, integer)):
                 gate_param.append(int(g.parameter))
+                gate_fixed.append(None)
             else:
-                # Fixed-value gate: resolve to its hidden slot (see __init__),
-                # not to int(g.parameter), which would silently truncate the
-                # value and alias it onto an unrelated trainable index.
-                gate_param.append(self._fixed_value_slots[float(g.parameter)])
+                # Fixed-value gate: hand the constant angle to the kernel, which
+                # folds its sin/cos into the coefficients and drops the branches
+                # that fold to zero. Never int(g.parameter), which would
+                # silently alias the value onto an unrelated trainable index.
+                gate_param.append(-1)
+                gate_fixed.append(float(g.parameter))
 
         # pprop_rs packs each Pauli word's x/z plane into a handful of u64
         # words (see native/pprop_rs/src/lib.rs) rather than one u64, so it
@@ -364,7 +361,7 @@ class Propagator:
 
         self.exprs = pprop_rs.propagate_batch(
             self.num_qubits,
-            gate_kind, gate_wire0, gate_wire1, gate_param,
+            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
             self.k1 if self.k1 is not None else -1,
             self.k2 if self.k2 is not None else -1,
             coeff_threshold if coeff_threshold is not None else -1.0,
@@ -378,7 +375,7 @@ class Propagator:
         self._eval_list = []
         self._eval_and_grad_list = []
         for expr in self.exprs:
-            fg = make_sparse_evaluator(expr, self._internal_num_params)
+            fg = make_sparse_evaluator(expr, self.num_params)
             self._eval_list.append(fg[0])
             self._eval_and_grad_list.append(fg[1])
 
@@ -430,12 +427,9 @@ class Propagator:
         if not expr:
             return S.Zero
 
-        # Real trainable indices get a symbolic angle θ0, θ1, …; fixed-value
-        # gates' hidden slots (see __init__) get their literal numeric value
-        # instead, since they aren't free variables of this expression.
-        theta = list(symbols(f"θ0:{self.num_params}", real=True))
-        value_by_slot = {slot: value for value, slot in self._fixed_value_slots.items()}
-        theta += [value_by_slot[i] for i in range(self.num_params, self._internal_num_params)]
+        # Every index in `exprs` is a trainable one: fixed-value gates were
+        # folded into the coefficients during propagation.
+        theta = symbols(f"θ0:{self.num_params}", real=True)
 
         terms = []
         for coeff, sin_idx, cos_idx in expr:
@@ -491,22 +485,6 @@ class Propagator:
         J, b, _ = affine_from_exprs(exprs, self.num_params)
         return BoundPropagator(self, J, b)
 
-    def _full_params(self, params: ndarray) -> ndarray:
-        """
-        Pad ``params`` (length :attr:`num_params`) with fixed-value gates'
-        hidden slots (length :attr:`_internal_num_params`), so ``sin``/``cos``
-        can be computed once over the full internal parameter vector.
-
-        Passthrough (no allocation) when there are no fixed-value gates.
-        """
-        if not self._fixed_value_slots:
-            return params
-        full = empty(self._internal_num_params)
-        full[: self.num_params] = params
-        for value, slot in self._fixed_value_slots.items():
-            full[slot] = value
-        return full
-
     # --------------- -
     # Dunder methods
     # --------------- -
@@ -542,8 +520,8 @@ class Propagator:
         ndarray of shape (num_observables,)
             Expectation value of each observable at ``params``.
         """
-        full = self._full_params(params)
-        sins, coss = sin(full), cos(full)
+        params = asarray(params, dtype=float)
+        sins, coss = sin(params), cos(params)
         if self._executor is not None:
             return array(list(self._executor.map(lambda f: f(sins, coss), self._eval_list)))
         return array([f(sins, coss) for f in self._eval_list])
@@ -569,8 +547,8 @@ class Propagator:
         """
         from numpy import stack
 
-        full = self._full_params(params)
-        sins, coss = sin(full), cos(full)
+        params = asarray(params, dtype=float)
+        sins, coss = sin(params), cos(params)
         if self._executor is not None:
             results = list(self._executor.map(lambda f: f(sins, coss), self._eval_and_grad_list))
         else:
@@ -578,8 +556,5 @@ class Propagator:
 
         # Unzip the list of (value, gradient) pairs into two separate arrays.
         vals  = array([v for v, _ in results])   # shape: (num_observables,)
-        grads = stack([g for _, g in results])    # shape: (num_observables, _internal_num_params)
-
-        # Fixed-value slots aren't trainable, drop their gradient columns so
-        # callers only ever see one column per entry of the params they passed in.
-        return vals, grads[:, : self.num_params]
+        grads = stack([g for _, g in results])    # shape: (num_observables, num_params)
+        return vals, grads
