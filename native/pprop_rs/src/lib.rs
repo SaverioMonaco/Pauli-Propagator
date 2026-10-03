@@ -48,6 +48,11 @@
 //! bit 6 -> `(x[1] >> 6) & 1 = 1`, `(z[1] >> 6) & 1 = 0` -> x-bit set,
 //! z-bit clear -> X.
 
+// Shards move term lists between threads. Use mimalloc for the extension's
+// cross-thread allocations; allocator choice is independent of threading.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
