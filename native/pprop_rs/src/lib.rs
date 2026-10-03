@@ -51,6 +51,7 @@
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyByteArray;
 use rustc_hash::FxHashMap;
 
 // One trigonometric product term as Python sees it: (coeff, sin_indices,
@@ -1694,10 +1695,52 @@ fn read_u32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     PyBuffer::<u32>::get_bound(obj)?.to_vec(obj.py())
 }
 
+/// The CSR layout `pprop.propagator.evaluator.build_ragged_arrays` builds
+/// (coefficients, lookup-table index of every factor, factors per term), as
+/// native-endian float64/int64 buffers for `numpy.frombuffer`. Same layout,
+/// entry for entry; this just skips the per-factor Python loop.
+#[pyfunction]
+fn ragged_layout<'py>(
+    py: Python<'py>,
+    expr: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    num_params: u32,
+) -> (
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+) {
+    let sentinel = num_params as i64;
+    let cos_offset = num_params as i64 + 1;
+    let mut coeffs: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut cnt: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut idx: Vec<u8> = Vec::new();
+    for (coeff, sin_idx, cos_idx) in &expr {
+        coeffs.extend_from_slice(&coeff.to_ne_bytes());
+        for &j in sin_idx {
+            idx.extend_from_slice(&(j as i64).to_ne_bytes());
+        }
+        for &j in cos_idx {
+            idx.extend_from_slice(&(cos_offset + j as i64).to_ne_bytes());
+        }
+        let mut n = (sin_idx.len() + cos_idx.len()) as i64;
+        if n == 0 {
+            idx.extend_from_slice(&sentinel.to_ne_bytes());
+            n = 1;
+        }
+        cnt.extend_from_slice(&n.to_ne_bytes());
+    }
+    (
+        PyByteArray::new_bound(py, &coeffs),
+        PyByteArray::new_bound(py, &idx),
+        PyByteArray::new_bound(py, &cnt),
+    )
+}
+
 #[pymodule]
 fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(propagate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
     m.add_class::<Evaluator>()?;
+    m.add_function(wrap_pyfunction!(ragged_layout, m)?)?;
     Ok(())
 }

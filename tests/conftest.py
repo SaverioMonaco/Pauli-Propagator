@@ -11,7 +11,7 @@ def pytest_sessionstart(session):
         import pprop_rs
     except ImportError as exc:
         raise pytest.UsageError("Build the native extension before running native CI") from exc
-    required = ("Evaluator",)
+    required = ("Evaluator", "ragged_layout")
     missing = [name for name in required if not hasattr(pprop_rs, name)]
     if missing:
         raise pytest.UsageError("Rebuild pprop_rs; missing native APIs: " + ", ".join(missing))

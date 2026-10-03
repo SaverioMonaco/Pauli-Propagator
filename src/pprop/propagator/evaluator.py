@@ -27,6 +27,11 @@ import numpy as np
 from ..pauli.sentence import CoeffTerms
 
 try:
+    from pprop_rs import ragged_layout as _rust_ragged_layout
+except ImportError:  # an older extension can still use the Python layout builder
+    _rust_ragged_layout = None
+
+try:
     from pprop_rs import Evaluator
 except ImportError:  # an older extension can still use the NumPy fallback
     Evaluator = None
@@ -86,6 +91,24 @@ def build_ragged_arrays(
     pointing at the sentinel, so that every run is non-empty and
     ``np.multiply.reduceat`` needs no special case.
     """
+    if _rust_ragged_layout is not None:
+        try:
+            buffers = _rust_ragged_layout(expr, num_params)
+        except TypeError:
+            pass  # the Python reference also accepts non-list index sequences
+        else:
+            coeffs, idx, cnt = buffers
+            return (np.frombuffer(coeffs, dtype=np.float64),
+                    np.frombuffer(idx, dtype=np.int64),
+                    np.frombuffer(cnt, dtype=np.int64))
+    return _build_ragged_arrays_py(expr, num_params)
+
+
+def _build_ragged_arrays_py(
+    expr: CoeffTerms,
+    num_params: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Python reference and fallback for :func:`build_ragged_arrays`."""
     sentinel = num_params
     cos_offset = num_params + 1
 
