@@ -48,24 +48,180 @@
 //! bit 6 -> `(x[1] >> 6) & 1 = 1`, `(z[1] >> 6) & 1 = 0` -> x-bit set,
 //! z-bit clear -> X.
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyByteArray;
 use rustc_hash::FxHashMap;
 
-// One trigonometric product term: (coeff, sin_indices, cos_indices) means
-// coeff * prod(sin(theta_i) for i in sin_indices) * prod(cos(theta_j) for j
-// in cos_indices), e.g. (0.5, [0], [1]) = 0.5*sin(theta_0)*cos(theta_1), and
-// (-0.25, [], [0, 0]) = -0.25*cos(theta_0)^2 (repeated index = squared). A
-// Pauli word's full coefficient is a Vec<CoeffTerm> - a sum of these - since
-// different gates along the circuit can each contribute their own factor.
+// One trigonometric product term as Python sees it: (coeff, sin_indices,
+// cos_indices) means coeff * prod(sin(theta_i) for i in sin_indices) *
+// prod(cos(theta_j) for j in cos_indices), e.g. (0.5, [0], [1]) =
+// 0.5*sin(theta_0)*cos(theta_1), and (-0.25, [], [0, 0]) =
+// -0.25*cos(theta_0)^2 (repeated index = squared). This is only the
+// boundary format; inside the propagation loop a term is a `Term`.
 type CoeffTerm = (f64, Vec<u32>, Vec<u32>);
+// A term during propagation: a coefficient times the monomial `mono` in a
+// `Monomials` arena, which has `depth` sin/cos factors (kept here rather than
+// in the arena so the k2 cutoff never has to look the monomial up). Plain
+// `Copy` data, 16 bytes, so branching a Pauli word copies each term instead
+// of cloning two heap-allocated index lists. A Pauli word's full coefficient
+// is a Vec<Term> - a sum of these - since different gates along the circuit
+// can each contribute their own factor.
+#[derive(Clone, Copy)]
+struct Term {
+    coeff: f64,
+    mono: u32,
+    depth: u32,
+}
+
+impl Term {
+    #[inline]
+    fn scaled(self, factor: f64) -> Term {
+        Term {
+            coeff: factor * self.coeff,
+            ..self
+        }
+    }
+
+    /// This term times one more sin/cos factor of `param`.
+    #[inline]
+    fn times(self, mono: &mut Monomials, param: u32, is_sin: bool) -> Term {
+        Term {
+            coeff: self.coeff,
+            mono: mono.push(self.mono, param, is_sin),
+            depth: self.depth + 1,
+        }
+    }
+}
 // (x, z) bitmask planes, same convention as pprop.pauli.op.PauliOp, packed
 // into NW little-endian u64 words instead of one u64 (see module docs above
 // for the worked "Y0 Z5 X70" example). A PauliKey<NW> value fully identifies
-// one Pauli word; FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> is "one Pauli word
+// one Pauli word; FxHashMap<PauliKey<NW>, Vec<Term>> is "one Pauli word
 // -> its current coefficient", the data structure the whole propagation
-// loop below rebuilds at every gate step.
+// loop below updates at every gate step.
 type PauliKey<const NW: usize> = ([u64; NW], [u64; NW]);
+// Output of evolving words through one gate, before truncation and insertion.
+type Emitted<const NW: usize> = Vec<(PauliKey<NW>, Vec<Term>)>;
+
+// ---------------------------------------------------------------------
+// Monomial arena
+// ---------------------------------------------------------------------
+//
+// Every monomial is a node holding one sin/cos factor and a link to the
+// monomial it extends; node 0 (`ROOT`) is the empty product. Appending a
+// factor is one push, and the sin and cos branches of a rotation share
+// their parent's whole chain instead of each copying it. A node's factors
+// are read back by walking to the root, which yields them newest first;
+// `to_lists` reverses that, so the index lists come out in the same order
+// they were appended in.
+//
+// Nodes are never freed individually. Terms dropped by pruning or
+// truncation leave dead nodes behind, so `compact` rebuilds the arena
+// from the live terms once it has grown enough (see `heisenberg_one`).
+
+#[derive(Clone, Copy)]
+struct Node {
+    parent: u32,
+    factor: u32, // param << 1 | is_sin
+}
+
+const ROOT: u32 = 0;
+// Compaction never runs below this many nodes (8 bytes each).
+const MIN_COMPACT_NODES: usize = 1 << 23;
+
+struct Monomials {
+    nodes: Vec<Node>,
+}
+
+impl Monomials {
+    fn new() -> Self {
+        Monomials {
+            nodes: vec![Node {
+                parent: ROOT,
+                factor: 0,
+            }],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[inline]
+    fn push(&mut self, parent: u32, param: u32, is_sin: bool) -> u32 {
+        let id = self.nodes.len();
+        assert!(id < u32::MAX as usize, "monomial arena exceeded u32 ids");
+        self.nodes.push(Node {
+            parent,
+            factor: (param << 1) | is_sin as u32,
+        });
+        id as u32
+    }
+
+    fn term_from_lists(&mut self, coeff: f64, sin_idx: &[u32], cos_idx: &[u32]) -> Term {
+        let mut term = Term {
+            coeff,
+            mono: ROOT,
+            depth: 0,
+        };
+        for &p in sin_idx {
+            term = term.times(self, p, true);
+        }
+        for &p in cos_idx {
+            term = term.times(self, p, false);
+        }
+        term
+    }
+
+    fn to_lists(&self, term: &Term) -> (Vec<u32>, Vec<u32>) {
+        let depth = term.depth as usize;
+        let mut sin_idx = Vec::with_capacity(depth);
+        let mut cos_idx = Vec::with_capacity(depth);
+        let mut id = term.mono;
+        while id != ROOT {
+            let node = self.nodes[id as usize];
+            if node.factor & 1 == 1 {
+                sin_idx.push(node.factor >> 1);
+            } else {
+                cos_idx.push(node.factor >> 1);
+            }
+            id = node.parent;
+        }
+        sin_idx.reverse();
+        cos_idx.reverse();
+        (sin_idx, cos_idx)
+    }
+
+    /// Rebuild the arena from the monomials `map` still references, and
+    /// rewrite every term's id to match. Shared prefixes stay shared.
+    fn compact<const NW: usize>(&mut self, map: &mut FxHashMap<PauliKey<NW>, Vec<Term>>) {
+        const UNSEEN: u32 = u32::MAX;
+        let mut remap = vec![UNSEEN; self.nodes.len()];
+        remap[ROOT as usize] = ROOT;
+        let mut kept = vec![self.nodes[ROOT as usize]];
+        let mut chain: Vec<u32> = Vec::new();
+        for terms in map.values_mut() {
+            for term in terms.iter_mut() {
+                let mut id = term.mono;
+                while remap[id as usize] == UNSEEN {
+                    chain.push(id);
+                    id = self.nodes[id as usize].parent;
+                }
+                while let Some(old) = chain.pop() {
+                    let node = self.nodes[old as usize];
+                    remap[old as usize] = kept.len() as u32;
+                    kept.push(Node {
+                        parent: remap[node.parent as usize],
+                        ..node
+                    });
+                }
+                term.mono = remap[term.mono as usize];
+            }
+        }
+        self.nodes = kept;
+    }
+}
 
 // Gate kind codes, matching pprop.propagator.GATE_KIND in __init__.py.
 const RX: u8 = 0;
@@ -87,8 +243,62 @@ struct GateSpec<const NW: usize> {
     kind: u8,
     wire0: u32,
     wire1: i64, // -1 unless two-qubit
-    param: i64, // -1 unless parametrised
+    param: i64, // -1 unless read from a trainable parameter slot
+    // Constant angle of a rotation/controlled-rotation gate that was given a
+    // plain float rather than a trainable index (e.g. `qml.RY(np.pi, wires=0)`).
+    // `None` for trainable and non-parametrised gates. See `fixed_sin_cos`.
+    fixed: Option<f64>,
     wire_mask: [u64; NW],
+}
+
+// ---------------------------------------------------------------------
+// Fixed-angle folding
+// ---------------------------------------------------------------------
+//
+// A rotation given a constant angle contributes constant factors, not
+// trigonometric ones, so - exactly like the T gate's 1/sqrt(2) - they are
+// multiplied straight into each term's coefficient instead of being pushed
+// onto its sin/cos index lists. Two things follow:
+//
+//   * a branch whose folded factor is zero is dropped before it is ever
+//     created. At any multiple of pi/2 one of sin/cos vanishes, so a fixed
+//     RY(pi) or CRX(pi) splits nothing and the term count stays what it
+//     would be without the gate;
+//   * a fixed gate no longer counts towards the `k2` frequency cutoff, which
+//     makes it consistent with T (a constant is a constant).
+//
+// `FOLD_SNAP` is the one judgement call: `f64::sin(PI)` is 1.22e-16, not 0,
+// and without snapping to a true zero the dead branch survives carrying
+// float noise. The worst case of snapping is dropping a term of size
+// |coeff| * 1e-12 per snapped factor, before accumulation across terms/gates.
+// This also snaps genuinely nonzero factors near quarter turns. It is an
+// approximation, not a test that an angle is exactly Clifford; large
+// observable coefficients amplify its absolute error (see propagate docs).
+
+const FOLD_SNAP: f64 = 1e-12;
+
+#[inline]
+fn snap(v: f64) -> f64 {
+    if v.abs() < FOLD_SNAP { 0.0 } else { v }
+}
+
+/// `(sin(theta), cos(theta))` of a fixed angle, with exact zeros at the
+/// quarter turns. Callers pass the angle in whatever convention the gate's
+/// rule table is written in (the full angle for RX/RY/RZ, the half angle
+/// for CRX/CRY/CRZ - see `controlledrotation.py`).
+fn fixed_sin_cos(theta: f64) -> (f64, f64) {
+    let (s, c) = theta.sin_cos();
+    (snap(s), snap(c))
+}
+
+/// Multiply every term's coefficient by a constant, in place.
+fn scale_terms(mut terms: Vec<Term>, factor: f64) -> Vec<Term> {
+    if factor != 1.0 {
+        for t in terms.iter_mut() {
+            *t = t.scaled(factor);
+        }
+    }
+    terms
 }
 
 // ---------------------------------------------------------------------
@@ -343,12 +553,26 @@ fn mask_is_zero<const NW: usize>(a: &[u64; NW]) -> bool {
     a.iter().all(|w| *w == 0)
 }
 
+/// Merge `terms` into `key`'s coefficient. A new word takes ownership of the
+/// vector as-is; only a word that already exists pays for a copy.
 fn insert_or_extend<const NW: usize>(
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    map: &mut FxHashMap<PauliKey<NW>, Vec<Term>>,
     key: PauliKey<NW>,
-    mut terms: Vec<CoeffTerm>,
+    mut terms: Vec<Term>,
 ) {
-    map.entry(key).or_insert_with(Vec::new).append(&mut terms);
+    use std::collections::hash_map::Entry;
+    match map.entry(key) {
+        Entry::Vacant(slot) => {
+            slot.insert(terms);
+        }
+        Entry::Occupied(mut slot) => {
+            let existing = slot.get_mut();
+            if existing.len() < terms.len() {
+                std::mem::swap(existing, &mut terms);
+            }
+            existing.append(&mut terms);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -531,61 +755,77 @@ fn crz_rule(code: u8) -> Option<CRRule> {
 // ---------------------------------------------------------------------
 // Generic per-gate-shape evolvers
 // ---------------------------------------------------------------------
+//
+// Each evolver takes one Pauli word with its terms and emits the words it
+// becomes. The propagation loop only passes in words the gate acts on (see
+// `gate_acts`), but the pass-through arms stay so every evolver remains a
+// complete transcription of its rule table for `evolve_single_gate_debug`.
 
 /// RX/RY/RZ shape: commuting Pauli passes through; anti-commuting Pauli
 /// splits into a cos(theta) branch (same word) and a sign*sin(theta) branch
-/// (new word).
+/// (new word). With a fixed angle the two factors are constants folded into
+/// the coefficients, and a branch whose factor is zero is not created.
+#[allow(clippy::too_many_arguments)]
 fn evolve_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], mut terms: Vec<Term>, wire: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<(u8, i8)>,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    mono: &mut Monomials,
+    out: &mut Emitted<NW>,
 ) {
     let label = pauli_label(&x, &z, wire);
     match rule(label) {
-        None => insert_or_extend(map, (x, z), terms),
+        None => out.push(((x, z), terms)),
         Some((out_label, sign)) => {
             let new_key = set_label(x, z, wire, out_label);
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta);
+                let s = sign as f64 * s;
+                if c != 0.0 && s != 0.0 {
+                    let cos_terms = scale_terms(terms.clone(), c);
+                    out.push(((x, z), cos_terms));
+                    out.push((new_key, scale_terms(terms, s)));
+                } else if c != 0.0 {
+                    out.push(((x, z), scale_terms(terms, c)));
+                } else if s != 0.0 {
+                    out.push((new_key, scale_terms(terms, s)));
+                }
+                // sin and cos cannot both snap to zero; nothing to do otherwise.
+                return;
+            }
             let p = param as u32;
-            let cos_terms: Vec<CoeffTerm> = terms
-                .iter()
-                .map(|(c, s, cc)| {
-                    let mut cc2 = cc.clone();
-                    cc2.push(p);
-                    (*c, s.clone(), cc2)
-                })
-                .collect();
-            let sin_terms: Vec<CoeffTerm> = terms
-                .into_iter()
-                .map(|(c, s, cc)| {
-                    let mut s2 = s;
-                    s2.push(p);
-                    (sign as f64 * c, s2, cc)
-                })
-                .collect();
-            insert_or_extend(map, (x, z), cos_terms);
-            insert_or_extend(map, new_key, sin_terms);
+            let cos_terms: Vec<Term> = terms.iter().map(|t| t.times(mono, p, false)).collect();
+            for t in terms.iter_mut() {
+                *t = t.times(mono, p, true).scaled(sign as f64);
+            }
+            out.push(((x, z), cos_terms));
+            out.push((new_key, terms));
         }
     }
+}
+
+/// Multiply every coefficient by -1 when `sign` is negative.
+fn apply_sign(mut terms: Vec<Term>, sign: i8) -> Vec<Term> {
+    if sign != 1 {
+        for t in terms.iter_mut() {
+            t.coeff = -t.coeff;
+        }
+    }
+    terms
 }
 
 /// H/S/SX shape: commuting Pauli passes through; otherwise exactly one
 /// output word with a constant +-1 sign (no trig, no branching).
 fn evolve_clifford1q<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32,
+    x: [u64; NW], z: [u64; NW], terms: Vec<Term>, wire: u32,
     rule: fn(u8) -> Option<(u8, i8)>,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    out: &mut Emitted<NW>,
 ) {
     let label = pauli_label(&x, &z, wire);
     match rule(label) {
-        None => insert_or_extend(map, (x, z), terms),
+        None => out.push(((x, z), terms)),
         Some((out_label, sign)) => {
             let new_key = set_label(x, z, wire, out_label);
-            let new_terms = if sign == 1 {
-                terms
-            } else {
-                terms.into_iter().map(|(c, s, cc)| (-c, s, cc)).collect()
-            };
-            insert_or_extend(map, new_key, new_terms);
+            out.push((new_key, apply_sign(terms, sign)));
         }
     }
 }
@@ -593,59 +833,54 @@ fn evolve_clifford1q<const NW: usize>(
 /// T-gate shape: commuting Pauli passes through; otherwise splits into two
 /// output words with constant (non-trig) phase multipliers.
 fn evolve_t<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    x: [u64; NW], z: [u64; NW], terms: Vec<Term>, wire: u32,
+    out: &mut Emitted<NW>,
 ) {
     let label = pauli_label(&x, &z, wire);
     match t_rule(label) {
-        None => insert_or_extend(map, (x, z), terms),
+        None => out.push(((x, z), terms)),
         Some([(l1, ph1), (l2, ph2)]) => {
             let k1 = set_label(x, z, wire, l1);
             let k2 = set_label(x, z, wire, l2);
-            let t1: Vec<CoeffTerm> = terms.iter().map(|(c, s, cc)| (ph1 * c, s.clone(), cc.clone())).collect();
-            let t2: Vec<CoeffTerm> = terms.into_iter().map(|(c, s, cc)| (ph2 * c, s, cc)).collect();
-            insert_or_extend(map, k1, t1);
-            insert_or_extend(map, k2, t2);
+            let t1: Vec<Term> = terms.iter().map(|t| t.scaled(ph1)).collect();
+            let t2: Vec<Term> = terms.into_iter().map(|t| t.scaled(ph2)).collect();
+            out.push((k1, t1));
+            out.push((k2, t2));
         }
     }
 }
 
 fn evolve_swap<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, w0: u32, w1: u32,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    x: [u64; NW], z: [u64; NW], terms: Vec<Term>, w0: u32, w1: u32,
+    out: &mut Emitted<NW>,
 ) {
     let l0 = pauli_label(&x, &z, w0);
     let l1 = pauli_label(&x, &z, w1);
     if l0 == l1 {
-        insert_or_extend(map, (x, z), terms);
+        out.push(((x, z), terms));
         return;
     }
     let (nx, nz) = set_label(x, z, w0, l1);
     let (nx, nz) = set_label(nx, nz, w1, l0);
-    insert_or_extend(map, (nx, nz), terms);
+    out.push(((nx, nz), terms));
 }
 
 /// CNOT/CY/CZ shape: commuting word passes through; otherwise exactly one
 /// output word with a constant +-1 sign applied to every term.
 fn evolve_controlled<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32,
+    x: [u64; NW], z: [u64; NW], terms: Vec<Term>, control: u32, target: u32,
     rule: fn(u8) -> Option<(u8, u8, i8)>,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    out: &mut Emitted<NW>,
 ) {
     let lc = pauli_label(&x, &z, control);
     let lt = pauli_label(&x, &z, target);
     let code = (lc << 2) | lt;
     match rule(code) {
-        None => insert_or_extend(map, (x, z), terms),
+        None => out.push(((x, z), terms)),
         Some((out_c, out_t, sign)) => {
             let (nx, nz) = set_label(x, z, control, out_c);
             let (nx, nz) = set_label(nx, nz, target, out_t);
-            let new_terms = if sign == 1 {
-                terms
-            } else {
-                terms.into_iter().map(|(c, s, cc)| (-c, s, cc)).collect()
-            };
-            insert_or_extend(map, (nx, nz), new_terms);
+            out.push(((nx, nz), apply_sign(terms, sign)));
         }
     }
 }
@@ -653,70 +888,115 @@ fn evolve_controlled<const NW: usize>(
 /// CRX/CRY/CRZ shape: commuting word passes through; otherwise up to 4
 /// output words, each scaling every existing term by a constant coefficient
 /// and appending 0-2 copies of the gate's parameter index to sin_idx/cos_idx.
+/// With a fixed angle those sin/cos powers are evaluated at the *half* angle
+/// (the rule tables are written in theta/2, see `controlledrotation.py`) and
+/// folded into the coefficient; branches whose factor is zero are dropped.
+#[allow(clippy::too_many_arguments)]
 fn evolve_controlled_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], terms: Vec<Term>, control: u32, target: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<CRRule>,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    mono: &mut Monomials,
+    out: &mut Emitted<NW>,
 ) {
     let lc = pauli_label(&x, &z, control);
     let lt = pauli_label(&x, &z, target);
     let code = (lc << 2) | lt;
     match rule(code) {
-        None => insert_or_extend(map, (x, z), terms),
+        None => out.push(((x, z), terms)),
         Some(branches) => {
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta / 2.0);
+                for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
+                    let factor = coeff * s.powi(n_sin as i32) * c.powi(n_cos as i32);
+                    if factor == 0.0 {
+                        continue;
+                    }
+                    let (nx, nz) = set_label(x, z, control, out_c);
+                    let (nx, nz) = set_label(nx, nz, target, out_t);
+                    out.push(((nx, nz), scale_terms(terms.clone(), factor)));
+                }
+                return;
+            }
             let p = param as u32;
             for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
                 let (nx, nz) = set_label(x, z, control, out_c);
                 let (nx, nz) = set_label(nx, nz, target, out_t);
-                let new_terms: Vec<CoeffTerm> = terms
+                let new_terms: Vec<Term> = terms
                     .iter()
-                    .map(|(c, s, cc)| {
-                        let mut s2 = s.clone();
+                    .map(|&t| {
+                        let mut t = t.scaled(coeff);
                         for _ in 0..n_sin {
-                            s2.push(p);
+                            t = t.times(mono, p, true);
                         }
-                        let mut cc2 = cc.clone();
                         for _ in 0..n_cos {
-                            cc2.push(p);
+                            t = t.times(mono, p, false);
                         }
-                        (coeff * c, s2, cc2)
+                        t
                     })
                     .collect();
-                insert_or_extend(map, (nx, nz), new_terms);
+                out.push(((nx, nz), new_terms));
             }
         }
     }
 }
 
-fn to_expectation<const NW: usize>(map: &FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>) -> Vec<CoeffTerm> {
+fn to_expectation<const NW: usize>(map: &FxHashMap<PauliKey<NW>, Vec<Term>>, mono: &Monomials) -> Vec<CoeffTerm> {
     let mut out = Vec::new();
     for ((x, _z), terms) in map.iter() {
         if mask_is_zero(x) {
-            out.extend(terms.iter().cloned());
+            for t in terms {
+                let (s, cc) = mono.to_lists(t);
+                out.push((t.coeff, s, cc));
+            }
         }
     }
     out
 }
 
+/// Whether `gate` changes the word `(x, z)` at all, i.e. whether its rule
+/// table has an entry for the word's labels on the gate's wires. Words it
+/// does not act on keep their key and terms unchanged.
+fn gate_acts<const NW: usize>(gate: &GateSpec<NW>, x: &[u64; NW], z: &[u64; NW]) -> bool {
+    let l0 = pauli_label(x, z, gate.wire0);
+    let two = || (l0 << 2) | pauli_label(x, z, gate.wire1 as u32);
+    match gate.kind {
+        RX => rx_rule(l0).is_some(),
+        RY => ry_rule(l0).is_some(),
+        RZ => rz_rule(l0).is_some(),
+        H => h_rule(l0).is_some(),
+        S => s_rule(l0).is_some(),
+        SX => sx_rule(l0).is_some(),
+        T => t_rule(l0).is_some(),
+        SWAP => l0 != pauli_label(x, z, gate.wire1 as u32),
+        CNOT => cnot_rule(two()).is_some(),
+        CY => cy_rule(two()).is_some(),
+        CZ => cz_rule(two()).is_some(),
+        CRX => crx_rule(two()).is_some(),
+        CRY => cry_rule(two()).is_some(),
+        CRZ => crz_rule(two()).is_some(),
+        _ => unreachable!("unknown gate kind {}", gate.kind),
+    }
+}
+
 fn evolve_one_gate<const NW: usize>(
-    gate: &GateSpec<NW>, x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>,
-    map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    gate: &GateSpec<NW>, x: [u64; NW], z: [u64; NW], terms: Vec<Term>,
+    mono: &mut Monomials, out: &mut Emitted<NW>,
 ) {
     match gate.kind {
-        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, rx_rule, map),
-        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, ry_rule, map),
-        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, rz_rule, map),
-        H => evolve_clifford1q(x, z, terms, gate.wire0, h_rule, map),
-        S => evolve_clifford1q(x, z, terms, gate.wire0, s_rule, map),
-        SX => evolve_clifford1q(x, z, terms, gate.wire0, sx_rule, map),
-        T => evolve_t(x, z, terms, gate.wire0, map),
-        SWAP => evolve_swap(x, z, terms, gate.wire0, gate.wire1 as u32, map),
-        CNOT => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cnot_rule, map),
-        CY => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cy_rule, map),
-        CZ => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cz_rule, map),
-        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crx_rule, map),
-        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, cry_rule, map),
-        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crz_rule, map),
+        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rx_rule, mono, out),
+        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, ry_rule, mono, out),
+        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rz_rule, mono, out),
+        H => evolve_clifford1q(x, z, terms, gate.wire0, h_rule, out),
+        S => evolve_clifford1q(x, z, terms, gate.wire0, s_rule, out),
+        SX => evolve_clifford1q(x, z, terms, gate.wire0, sx_rule, out),
+        T => evolve_t(x, z, terms, gate.wire0, out),
+        SWAP => evolve_swap(x, z, terms, gate.wire0, gate.wire1 as u32, out),
+        CNOT => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cnot_rule, out),
+        CY => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cy_rule, out),
+        CZ => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cz_rule, out),
+        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crx_rule, mono, out),
+        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, cry_rule, mono, out),
+        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crz_rule, mono, out),
         _ => unreachable!("unknown gate kind {}", gate.kind),
     }
 }
@@ -725,94 +1005,233 @@ fn evolve_one_gate<const NW: usize>(
 // Heisenberg propagation loop
 // ---------------------------------------------------------------------
 
+/// XYWeightPruner verdict: can the gates in `gate_masks` (the rest of the
+/// circuit, in order) still reduce this word's XY-weight to zero? Each gate
+/// that touches the growing causal cone of `x` can remove at most one X/Y.
+fn xy_reachable<const NW: usize>(x: &[u64; NW], gate_masks: &[[u64; NW]]) -> bool {
+    let xy_weight = mask_popcount(x);
+    if xy_weight == 0 {
+        return true;
+    }
+    let mut xy_support = *x;
+    let mut budget = 0u32;
+    for gm in gate_masks {
+        if mask_intersects(gm, &xy_support) {
+            budget += 1;
+            mask_or_assign(&mut xy_support, gm);
+            if budget >= xy_weight {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Apply the k1/k2/coefficient truncations to one word; `false` means the
+/// word has nothing left and should be dropped.
+fn truncate<const NW: usize>(
+    key: &PauliKey<NW>,
+    terms: &mut Vec<Term>,
+    k1: i64,
+    k2: i64,
+    coeff_threshold: f64,
+) -> bool {
+    if k1 >= 0 && combined_weight(&key.0, &key.1) > k1 as u32 {
+        return false;
+    }
+    if k2 >= 0 {
+        let k2u = k2 as u32;
+        terms.retain(|t| t.depth <= k2u);
+    }
+    if coeff_threshold >= 0.0 {
+        terms.retain(|t| t.coeff.abs() >= coeff_threshold);
+    }
+    !terms.is_empty()
+}
+
+/// A run of consecutive gates (in propagation order) on pairwise disjoint
+/// wires. Such gates commute, and a word's labels on one gate's wires are
+/// untouched by the others, so the gates a word will meet in the layer can
+/// be read off the word once, before any of them is applied.
+struct Layer<const NW: usize> {
+    start: usize,
+    end: usize,
+    mask: [u64; NW],
+}
+
+/// Split `gate_masks` greedily into maximal runs of wire-disjoint gates.
+fn build_layers<const NW: usize>(gate_masks: &[[u64; NW]]) -> Vec<Layer<NW>> {
+    let mut layers: Vec<Layer<NW>> = Vec::new();
+    for (i, gm) in gate_masks.iter().enumerate() {
+        match layers.last_mut() {
+            Some(layer) if !mask_intersects(&layer.mask, gm) => {
+                layer.end = i + 1;
+                mask_or_assign(&mut layer.mask, gm);
+            }
+            _ => layers.push(Layer {
+                start: i,
+                end: i + 1,
+                mask: *gm,
+            }),
+        }
+    }
+    layers
+}
+
+/// Propagate one observable backwards through `reversed`.
+///
+/// The map is updated in place, one layer (see `Layer`) at a time. A single
+/// pass over the map moves out the words some gate in the layer acts on and
+/// leaves every other word where it is. Each moved-out word is then carried
+/// through the gates that act on it, in circuit order, and whatever comes out
+/// is merged back in. The result is the same as applying one gate at a time
+/// to the whole map, with pruning and truncation after every gate:
+///
+/// * Truncation (k1/k2/coefficient) depends only on a word's key and terms,
+///   so it only has to run when a gate produces a word. The observable's own
+///   words are truncated once, like everything else after the first gate
+///   step that touches any of them.
+/// * Both exact pruners are monotone along the circuit: a word rejected at
+///   one gate would be rejected at every later gate too (DeadQubitPruner's
+///   set of still-reachable qubits only shrinks; XYWeightPruner's budget
+///   only shrinks as gates are used up). So a word is checked only when a
+///   gate is about to act on it, which rejects it exactly when some earlier
+///   check would have. A dead word that no gate touches again just sits in
+///   the map; it has an X/Y somewhere, so it never reaches the expectation.
 #[allow(clippy::too_many_arguments)]
 fn heisenberg_one<const NW: usize>(
     reversed: &[GateSpec<NW>],
     gate_masks: &[[u64; NW]],
+    layers: &[Layer<NW>],
     active_qubits_from: &[[u64; NW]],
-    mut map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
+    mut map: FxHashMap<PauliKey<NW>, Vec<Term>>,
+    mono: &mut Monomials,
     k1: i64,
     k2: i64,
     coeff_threshold: f64, // < 0 disables
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
 ) -> Vec<CoeffTerm> {
-    let n = reversed.len();
     let mut active_mask = [0u64; NW];
     for (x, z) in map.keys() {
         mask_or_assign(&mut active_mask, x);
         mask_or_assign(&mut active_mask, z);
     }
+    // The first gate the one-gate-at-a-time loop would not skip. Until it
+    // has been applied, the observable's own words are untruncated.
+    let first_gate = gate_masks
+        .iter()
+        .position(|gm| mask_intersects(gm, &active_mask));
 
-    for i in 0..n {
-        let gate = &reversed[i];
-        if !mask_intersects(&gate.wire_mask, &active_mask) {
+    // Gate owning each qubit in the current layer (usize::MAX = none).
+    let mut gate_on_qubit = vec![usize::MAX; NW * 64];
+    let mut acted: Vec<(PauliKey<NW>, Vec<Term>, Vec<usize>)> = Vec::new();
+    let mut work: Vec<(PauliKey<NW>, Vec<Term>, usize)> = Vec::new();
+    let mut emitted: Emitted<NW> = Vec::new();
+    let mut done: Emitted<NW> = Vec::new();
+    let mut compact_at = MIN_COMPACT_NODES.max(4 * mono.len());
+    let mut started = false;
+
+    for layer in layers {
+        if !mask_intersects(&layer.mask, &active_mask) {
             continue;
         }
-
-        if use_dead_qubit_pruner {
-            let allowed = &active_qubits_from[i];
-            // DeadQubitPruner: word is dead if it has X/Y (x-bit set) on a qubit
-            // that no remaining gate (incl. this one) will ever touch again.
-            map.retain(|(x, _z), _| mask_subset(x, allowed));
+        // Only the first layer processed still holds untruncated words.
+        let fresh = !started;
+        started = true;
+        let layer_masks = &gate_masks[layer.start..layer.end];
+        for (g, gm) in (layer.start..).zip(layer_masks) {
+            for_each_bit(gm, |q| gate_on_qubit[q] = g);
         }
 
-        if use_xy_weight_pruner {
-            // XYWeightPruner: word is dead if its XY-weight exceeds the max
-            // reduction achievable by the causal cone of remaining gates.
-            map.retain(|(x, _z), _| {
-                let xy_weight = mask_popcount(x);
-                if xy_weight == 0 {
-                    return true;
+        // Pull out the words this layer acts on, each with the (ascending)
+        // indices of the gates that act on it.
+        let mut next_active = [0u64; NW];
+        map.retain(|key, terms| {
+            let (x, z) = key;
+            let support = mask_or(x, z);
+            let mut gates: Vec<usize> = Vec::new();
+            if mask_intersects(&support, &layer.mask) {
+                for_each_bit(&support, |q| {
+                    let g = gate_on_qubit[q];
+                    if g != usize::MAX && !gates.contains(&g) && gate_acts(&reversed[g], x, z) {
+                        gates.push(g);
+                    }
+                });
+            }
+            if !gates.is_empty() {
+                gates.sort_unstable();
+                acted.push((*key, std::mem::take(terms), gates));
+                return false;
+            }
+            if fresh && !truncate(key, terms, k1, k2, coeff_threshold) {
+                return false;
+            }
+            mask_or_assign(&mut next_active, &support);
+            true
+        });
+
+        for (key, terms, gates) in acted.drain(..) {
+            work.push((key, terms, 0));
+            while let Some((key, mut terms, pos)) = work.pop() {
+                if pos == gates.len() {
+                    done.push((key, terms));
+                    continue;
                 }
-                let mut xy_support = *x;
-                let mut budget = 0u32;
-                for gm in &gate_masks[i..n] {
-                    if mask_intersects(gm, &xy_support) {
-                        budget += 1;
-                        mask_or_assign(&mut xy_support, gm);
-                        if budget >= xy_weight {
-                            break;
-                        }
+                let g = gates[pos];
+                if fresh && first_gate != Some(g) && pos == 0 {
+                    // An observable word the first gate step left alone: it
+                    // was truncated along with everything else after it.
+                    if !truncate(&key, &mut terms, k1, k2, coeff_threshold) {
+                        continue;
                     }
                 }
-                budget >= xy_weight
-            });
+                // DeadQubitPruner: word is dead if it has X/Y (x-bit set) on a
+                // qubit that no remaining gate (incl. this one) touches again.
+                if use_dead_qubit_pruner && !mask_subset(&key.0, &active_qubits_from[g]) {
+                    continue;
+                }
+                if use_xy_weight_pruner && !xy_reachable(&key.0, &gate_masks[g..]) {
+                    continue;
+                }
+                evolve_one_gate(&reversed[g], key.0, key.1, terms, mono, &mut emitted);
+                for (out_key, mut out_terms) in emitted.drain(..) {
+                    if truncate(&out_key, &mut out_terms, k1, k2, coeff_threshold) {
+                        work.push((out_key, out_terms, pos + 1));
+                    }
+                }
+            }
         }
 
-        let mut new_map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> = FxHashMap::default();
-        new_map.reserve(map.len());
-        for ((x, z), terms) in map.drain() {
-            evolve_one_gate(gate, x, z, terms, &mut new_map);
+        for (key, terms) in done.drain(..) {
+            mask_or_assign(&mut next_active, &key.0);
+            mask_or_assign(&mut next_active, &key.1);
+            insert_or_extend(&mut map, key, terms);
         }
-        map = new_map;
+        active_mask = next_active;
 
-        if k1 >= 0 {
-            let k1u = k1 as u32;
-            map.retain(|(x, z), _| combined_weight(x, z) <= k1u);
+        for gm in layer_masks {
+            for_each_bit(gm, |q| gate_on_qubit[q] = usize::MAX);
         }
-        if k2 >= 0 {
-            let k2u = k2 as usize;
-            map.retain(|_, terms| {
-                terms.retain(|(_, s, c)| s.len() + c.len() <= k2u);
-                !terms.is_empty()
-            });
-        }
-        if coeff_threshold >= 0.0 {
-            map.retain(|_, terms| {
-                terms.retain(|(c, _, _)| c.abs() >= coeff_threshold);
-                !terms.is_empty()
-            });
-        }
-
-        active_mask = [0u64; NW];
-        for (x, z) in map.keys() {
-            mask_or_assign(&mut active_mask, x);
-            mask_or_assign(&mut active_mask, z);
+        if mono.len() >= compact_at {
+            mono.compact(&mut map);
+            compact_at = MIN_COMPACT_NODES.max(4 * mono.len());
         }
     }
 
-    to_expectation(&map)
+    to_expectation(&map, mono)
+}
+
+/// Call `f` with the index of every set bit in `mask`, lowest first.
+#[inline]
+fn for_each_bit<const NW: usize>(mask: &[u64; NW], mut f: impl FnMut(usize)) {
+    for (w, &word) in mask.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            f(w * 64 + bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -821,6 +1240,7 @@ fn propagate_batch_impl<const NW: usize>(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -841,6 +1261,7 @@ fn propagate_batch_impl<const NW: usize>(
             wire0: gate_wire0[i],
             wire1: gate_wire1[i],
             param: gate_param[i],
+            fixed: gate_fixed[i],
             wire_mask,
         });
     }
@@ -848,6 +1269,7 @@ fn propagate_batch_impl<const NW: usize>(
     let reversed: Vec<GateSpec<NW>> = gates.into_iter().rev().collect();
     let n = reversed.len();
     let gate_masks: Vec<[u64; NW]> = reversed.iter().map(|g| g.wire_mask).collect();
+    let layers = build_layers(&gate_masks);
 
     // Suffix union of wire masks: active_qubits_from[i] = qubits touched by
     // gates i..n-1 (used by DeadQubitPruner).
@@ -858,13 +1280,15 @@ fn propagate_batch_impl<const NW: usize>(
 
     let mut results = Vec::with_capacity(paulidicts.len());
     for pd_spec in paulidicts {
-        let mut map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> = FxHashMap::default();
+        let mut mono = Monomials::new();
+        let mut map: FxHashMap<PauliKey<NW>, Vec<Term>> = FxHashMap::default();
         for (xw, zw, coeff, sin_idx, cos_idx) in pd_spec {
             let key = (words_to_array::<NW>(&xw), words_to_array::<NW>(&zw));
-            map.entry(key).or_insert_with(Vec::new).push((coeff, sin_idx, cos_idx));
+            let term = mono.term_from_lists(coeff, &sin_idx, &cos_idx);
+            map.entry(key).or_default().push(term);
         }
         let expr = heisenberg_one(
-            &reversed, &gate_masks, &active_qubits_from, map,
+            &reversed, &gate_masks, &layers, &active_qubits_from, map, &mut mono,
             k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
         );
         results.push(expr);
@@ -907,7 +1331,7 @@ macro_rules! dispatch_nw {
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits,
-    gate_kind, gate_wire0, gate_wire1, gate_param,
+    gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
     k1, k2, coeff_threshold,
     use_dead_qubit_pruner, use_xy_weight_pruner,
     paulidicts,
@@ -919,6 +1343,7 @@ fn propagate_batch(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -930,7 +1355,7 @@ fn propagate_batch(
     dispatch_nw!(
         nw, num_qubits, propagate_batch_impl,
         (
-            gate_kind, gate_wire0, gate_wire1, gate_param,
+            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
             k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
             paulidicts,
         )
@@ -942,6 +1367,7 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     wire0: u32,
     wire1: i64,
     param: i64,
+    fixed: Option<f64>,
     x: &[u64],
     z: &[u64],
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
@@ -951,14 +1377,19 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     if wire1 >= 0 {
         set_wire_bit(&mut wire_mask, wire1 as u32);
     }
-    let gate = GateSpec::<NW> { kind, wire0, wire1, param, wire_mask };
-    let mut map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> = FxHashMap::default();
-    evolve_one_gate(&gate, words_to_array::<NW>(x), words_to_array::<NW>(z), terms, &mut map);
-    map.into_iter()
-        .flat_map(|((ox, oz), terms)| {
-            terms.into_iter().map(move |(c, s, cc)| (ox.to_vec(), oz.to_vec(), c, s, cc))
-        })
-        .collect()
+    let gate = GateSpec::<NW> { kind, wire0, wire1, param, fixed, wire_mask };
+    let mut mono = Monomials::new();
+    let terms: Vec<Term> = terms.iter().map(|(c, s, cc)| mono.term_from_lists(*c, s, cc)).collect();
+    let mut out: Emitted<NW> = Vec::new();
+    evolve_one_gate(&gate, words_to_array::<NW>(x), words_to_array::<NW>(z), terms, &mut mono, &mut out);
+    let mut rows = Vec::new();
+    for ((ox, oz), terms) in out {
+        for t in terms {
+            let (s, cc) = mono.to_lists(&t);
+            rows.push((ox.to_vec(), oz.to_vec(), t.coeff, s, cc));
+        }
+    }
+    rows
 }
 
 /// Test-only helper: evolve a single Pauli word through one gate and return
@@ -966,8 +1397,11 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
 /// `propagate_batch`). Used by `tests/test_rule_tables.py` to cross-check
 /// every gate's `rule` dict in `pprop/gates/*.py` directly against this
 /// file's rule tables, term-for-term, independent of whether the output
-/// happens to land in the Z/I subspace.
+/// happens to land in the Z/I subspace. `fixed` is the constant angle of a
+/// non-trainable rotation (see `GateSpec::fixed`); leave it `None` for a
+/// trainable one.
 #[pyfunction]
+#[pyo3(signature = (num_qubits, kind, wire0, wire1, param, x, z, terms, fixed = None))]
 #[allow(clippy::too_many_arguments)]
 fn evolve_single_gate_debug(
     num_qubits: u32,
@@ -978,17 +1412,335 @@ fn evolve_single_gate_debug(
     x: Vec<u64>,
     z: Vec<u64>,
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    fixed: Option<f64>,
 ) -> PyResult<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>> {
     let nw = words_needed(num_qubits);
     Ok(dispatch_nw!(
         nw, num_qubits, evolve_single_gate_debug_impl,
-        (kind, wire0, wire1, param, &x, &z, terms)
+        (kind, wire0, wire1, param, fixed, &x, &z, terms)
     ))
+}
+
+/// Add `term` to the accumulator slot of every factor in `run`, spreading
+/// consecutive factors over `C` interleaved copies of the accumulator so that
+/// a recurring parameter does not stall on the previous read-modify-write.
+///
+/// The writes skip bounds checking: `Evaluator::new` rejects any index that
+/// does not address one copy, and `acc` is `C * width` long.
+#[inline]
+fn scatter<const C: usize>(run: &[u32], term: f64, acc: &mut [f64], width: usize) {
+    let mut chunks = run.chunks_exact(C);
+    for chunk in &mut chunks {
+        for (copy, &entry) in chunk.iter().enumerate() {
+            unsafe { *acc.get_unchecked_mut(copy * width + entry as usize) += term };
+        }
+    }
+    for &entry in chunks.remainder() {
+        unsafe { *acc.get_unchecked_mut(entry as usize) += term };
+    }
+}
+
+/// Compiled evaluator for one propagated expression, mirroring the NumPy
+/// implementation in `pprop.propagator.evaluator` (see `build_ragged_arrays`
+/// there for how `coeffs`/`idx`/`cnt` are produced and what the index space
+/// means). Everything below is that same arithmetic with the intermediate
+/// arrays removed: the terms are walked once, factor by factor, keeping the
+/// running products in registers rather than materialising one temporary per
+/// pass.
+///
+/// Index space, with `P = num_params`: a factor `sin(theta_k)` is `k`, a
+/// factor `cos(theta_k)` is `P + 1 + k`, and `P` itself is a sentinel whose
+/// value is 1 (it stands in for a term with no factors left). Powers are
+/// repeated indices, so no exponent is ever evaluated.
+#[pyclass]
+pub struct Evaluator {
+    coeffs: Vec<f64>,
+    idx: Vec<u32>,
+    /// Start of each term's run in `idx`, with a closing entry: length is
+    /// `coeffs.len() + 1`.
+    off: Vec<usize>,
+    num_params: usize,
+    /// Longest single term, i.e. the scratch space the exact path needs.
+    max_run: usize,
+    /// How many interleaved copies of the gradient accumulator to keep -
+    /// 4, 2 or 1, whichever fits in L1 for this parameter count. See
+    /// `scatter`.
+    acc_copies: usize,
+    tol: f64,
+}
+
+impl Evaluator {
+    /// `[sin(theta_0..P-1), 1.0, cos(theta_0..P-1)]`, the table `idx` reads.
+    fn table(&self, sins: &[f64], coss: &[f64]) -> Vec<f64> {
+        let p = self.num_params;
+        let mut table = Vec::with_capacity(2 * p + 1);
+        table.extend_from_slice(sins);
+        table.push(1.0);
+        table.extend_from_slice(coss);
+        table
+    }
+
+    /// Product of one term's factors. Four independent accumulators, so the
+    /// multiplies pipeline instead of forming one dependency chain per term.
+    ///
+    /// The table lookups skip bounds checking: `new` rejects any index that
+    /// does not address `table`, which is the only place `idx` is set.
+    #[inline]
+    fn term_product(&self, table: &[f64], start: usize, end: usize) -> f64 {
+        debug_assert!(table.len() == 2 * self.num_params + 1);
+        let run = &self.idx[start..end];
+        let (mut a, mut b, mut c, mut d) = (1.0, 1.0, 1.0, 1.0);
+        let mut chunks = run.chunks_exact(4);
+        for chunk in &mut chunks {
+            unsafe {
+                a *= *table.get_unchecked(chunk[0] as usize);
+                b *= *table.get_unchecked(chunk[1] as usize);
+                c *= *table.get_unchecked(chunk[2] as usize);
+                d *= *table.get_unchecked(chunk[3] as usize);
+            }
+        }
+        for &entry in chunks.remainder() {
+            a *= unsafe { *table.get_unchecked(entry as usize) };
+        }
+        (a * b) * (c * d)
+    }
+
+    /// Gradient via the logarithmic derivative: every factor on parameter `k`
+    /// contributes `term * cot(theta_k)` (or `-term * tan(theta_k)` for a
+    /// cosine), which depends only on `k`. So the factors just accumulate
+    /// term values per parameter and the cot/tan multiply happens once over
+    /// the parameter vector. Requires every angle to sit away from a zero of
+    /// sin/cos; `grad_exact` handles the rest.
+    fn grad_fast(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
+        let p = self.num_params;
+        let table = self.table(sins, coss);
+        let width = 2 * p + 1;
+        // Consecutive factors are scattered into *different* copies of the
+        // accumulator, so a parameter that recurs within a few factors does
+        // not stall waiting on the previous read-modify-write. The copies are
+        // summed back together at the end.
+        let copies = self.acc_copies;
+        let mut acc = vec![0.0f64; copies * width];
+        let mut value = 0.0;
+
+        for t in 0..self.coeffs.len() {
+            let (start, end) = (self.off[t], self.off[t + 1]);
+            let term = self.coeffs[t] * self.term_product(&table, start, end);
+            value += term;
+            let run = &self.idx[start..end];
+            match copies {
+                4 => scatter::<4>(run, term, &mut acc, width),
+                2 => scatter::<2>(run, term, &mut acc, width),
+                _ => scatter::<1>(run, term, &mut acc, width),
+            }
+        }
+
+        for k in 0..p {
+            let mut sin_total = 0.0;
+            let mut cos_total = 0.0;
+            for c in 0..copies {
+                sin_total += acc[c * width + k];
+                cos_total += acc[c * width + p + 1 + k];
+            }
+            grad[k] = (coss[k] / sins[k]) * sin_total - (sins[k] / coss[k]) * cos_total;
+        }
+        value
+    }
+
+    /// Gradient without dividing by anything: for each term, walk its factors
+    /// forwards recording partial products, then backwards multiplying by the
+    /// running suffix, which gives the product of all *other* factors exactly.
+    /// Costs a second pass over each term and some scratch, and is used only
+    /// when an angle sits at (or extremely near) a zero of sin or cos, where
+    /// the cot/tan form above is singular. Repeated indices come out right on
+    /// their own: p copies each contribute the product of the other p-1.
+    fn grad_exact(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
+        let p = self.num_params;
+        let table = self.table(sins, coss);
+        let mut prefix = vec![0.0f64; self.max_run];
+        let mut value = 0.0;
+
+        for t in 0..self.coeffs.len() {
+            let (start, end) = (self.off[t], self.off[t + 1]);
+            let coeff = self.coeffs[t];
+
+            let mut running = 1.0;
+            for (j, i) in (start..end).enumerate() {
+                prefix[j] = running;
+                running *= table[self.idx[i] as usize];
+            }
+            value += coeff * running;
+
+            let mut suffix = 1.0;
+            for (j, i) in (start..end).enumerate().rev() {
+                let entry = self.idx[i] as usize;
+                let excluding = coeff * prefix[j] * suffix;
+                if entry < p {
+                    grad[entry] += excluding * coss[entry];        // d sin / d theta
+                } else if entry > p {
+                    let k = entry - (p + 1);
+                    grad[k] -= excluding * sins[k];                // d cos / d theta
+                }
+                suffix *= table[entry];
+            }
+        }
+        value
+    }
+}
+
+#[pymethods]
+impl Evaluator {
+    /// `coeffs`, `idx` and `cnt` are the arrays `build_ragged_arrays` returns,
+    /// as buffers (`float64`, `uint32`, `uint32`).
+    #[new]
+    #[pyo3(signature = (coeffs, idx, cnt, num_params, tol = 1e-6))]
+    fn new(
+        coeffs: &Bound<'_, PyAny>,
+        idx: &Bound<'_, PyAny>,
+        cnt: &Bound<'_, PyAny>,
+        num_params: usize,
+        tol: f64,
+    ) -> PyResult<Self> {
+        let coeffs = read_f64(coeffs)?;
+        let idx = read_u32(idx)?;
+        let cnt = read_u32(cnt)?;
+        if cnt.len() != coeffs.len() {
+            return Err(PyValueError::new_err("coeffs and cnt must have equal length"));
+        }
+
+        let mut off = Vec::with_capacity(cnt.len() + 1);
+        let mut total = 0usize;
+        off.push(0);
+        for &c in &cnt {
+            total += c as usize;
+            off.push(total);
+        }
+        if total != idx.len() {
+            return Err(PyValueError::new_err("cnt does not add up to len(idx)"));
+        }
+        let limit = 2 * num_params + 1;
+        if idx.iter().any(|&i| i as usize >= limit) {
+            return Err(PyValueError::new_err("factor index out of range"));
+        }
+
+        let max_run = cnt.iter().map(|&c| c as usize).max().unwrap_or(0);
+        // Keep the interleaved accumulators inside ~16 KB, i.e. half of a
+        // typical L1, or the trick costs more in misses than it saves. Wide
+        // parameter vectors settle for two copies, or one.
+        let width = 2 * num_params + 1;
+        let bytes = width * std::mem::size_of::<f64>();
+        let acc_copies = [4, 2, 1].into_iter().find(|c| c * bytes <= 16 * 1024).unwrap_or(1);
+        Ok(Evaluator { coeffs, idx, off, num_params, max_run, acc_copies, tol })
+    }
+
+    /// Expectation value at the given `sin(theta)`/`cos(theta)`.
+    fn eval(&self, py: Python<'_>, sins: &Bound<'_, PyAny>, coss: &Bound<'_, PyAny>)
+        -> PyResult<f64>
+    {
+        let sins = self.read_angles(sins)?;
+        let coss = self.read_angles(coss)?;
+        Ok(py.allow_threads(|| {
+            let table = self.table(&sins, &coss);
+            (0..self.coeffs.len())
+                .map(|t| self.coeffs[t] * self.term_product(&table, self.off[t], self.off[t + 1]))
+                .sum()
+        }))
+    }
+
+    /// Expectation value, writing the gradient into `out` (`float64`, length
+    /// `num_params`) rather than allocating a fresh array per call.
+    fn eval_and_grad(
+        &self,
+        py: Python<'_>,
+        sins: &Bound<'_, PyAny>,
+        coss: &Bound<'_, PyAny>,
+        out: &Bound<'_, PyAny>,
+    ) -> PyResult<f64> {
+        let sins = self.read_angles(sins)?;
+        let coss = self.read_angles(coss)?;
+        let buffer = PyBuffer::<f64>::get_bound(out)?;
+        if buffer.item_count() != self.num_params || buffer.readonly() {
+            return Err(PyValueError::new_err("out must be a writable float64 array of length num_params"));
+        }
+
+        let mut grad = vec![0.0f64; self.num_params];
+        let value = py.allow_threads(|| {
+            let singular = sins.iter().chain(coss.iter()).any(|v| v.abs() < self.tol);
+            if singular {
+                self.grad_exact(&sins, &coss, &mut grad)
+            } else {
+                self.grad_fast(&sins, &coss, &mut grad)
+            }
+        });
+        buffer.copy_from_slice(py, &grad)?;
+        Ok(value)
+    }
+}
+
+impl Evaluator {
+    fn read_angles(&self, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+        let values = read_f64(obj)?;
+        if values.len() != self.num_params {
+            return Err(PyValueError::new_err("sins/coss must have length num_params"));
+        }
+        Ok(values)
+    }
+}
+
+fn read_f64(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    PyBuffer::<f64>::get_bound(obj)?.to_vec(obj.py())
+}
+
+fn read_u32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    PyBuffer::<u32>::get_bound(obj)?.to_vec(obj.py())
+}
+
+/// The CSR layout `pprop.propagator.evaluator.build_ragged_arrays` builds
+/// (coefficients, lookup-table index of every factor, factors per term), as
+/// native-endian float64/int64 buffers for `numpy.frombuffer`. Same layout,
+/// entry for entry; this just skips the per-factor Python loop.
+#[pyfunction]
+fn ragged_layout<'py>(
+    py: Python<'py>,
+    expr: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    num_params: u32,
+) -> (
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+) {
+    let sentinel = num_params as i64;
+    let cos_offset = num_params as i64 + 1;
+    let mut coeffs: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut cnt: Vec<u8> = Vec::with_capacity(8 * expr.len());
+    let mut idx: Vec<u8> = Vec::new();
+    for (coeff, sin_idx, cos_idx) in &expr {
+        coeffs.extend_from_slice(&coeff.to_ne_bytes());
+        for &j in sin_idx {
+            idx.extend_from_slice(&(j as i64).to_ne_bytes());
+        }
+        for &j in cos_idx {
+            idx.extend_from_slice(&(cos_offset + j as i64).to_ne_bytes());
+        }
+        let mut n = (sin_idx.len() + cos_idx.len()) as i64;
+        if n == 0 {
+            idx.extend_from_slice(&sentinel.to_ne_bytes());
+            n = 1;
+        }
+        cnt.extend_from_slice(&n.to_ne_bytes());
+    }
+    (
+        PyByteArray::new_bound(py, &coeffs),
+        PyByteArray::new_bound(py, &idx),
+        PyByteArray::new_bound(py, &cnt),
+    )
 }
 
 #[pymodule]
 fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(propagate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
+    m.add_class::<Evaluator>()?;
+    m.add_function(wrap_pyfunction!(ragged_layout, m)?)?;
     Ok(())
 }
