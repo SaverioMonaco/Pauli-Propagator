@@ -1,18 +1,15 @@
 //! Rust implementation of pprop's Heisenberg propagation core.
 //!
-//! This is the *only* propagation backend in pprop (see the
-//! project README / paper appendix for why the pure-Python
-//! `heisenberg()`/`PauliDict` implementation was removed rather than kept
-//! alongside this one). It covers every gate in `pprop.gates`
-//! (RX/RY/RZ, H/S/SX/T, SWAP, CNOT/CY/CZ, CRX/CRY/CRZ), both exact pruners
-//! (`DeadQubitPruner`, `XYWeightPruner`), and all three truncations
-//! (`WeightTruncation`, `FrequencyTruncation`, `CoefficientTruncation`).
-//! The evolution rule tables below are transcribed 1:1 from the `rule` dicts
-//! in `pprop/gates/*.py`, which remain in the Python source as the
-//! human-readable reference these tables are checked against, entry-for-entry,
-//! by `tests/test_rule_tables.py` (via `evolve_single_gate_debug` below).
-//! `tests/test_backends.py` covers correctness at the full-circuit level
-//! instead (random circuits vs. PennyLane directly).
+//! It covers every gate in `pprop.gates` (RX/RY/RZ, H/S/SX/T, SWAP, CNOT/CY/CZ,
+//! CRX/CRY/CRZ), both exact pruners (`DeadQubitPruner`, `XYWeightPruner`), and
+//! all three truncations (`WeightTruncation`, `FrequencyTruncation`,
+//! `CoefficientTruncation`). The evolution rule tables below are transcribed
+//! 1:1 from the `rule` dicts in `pprop/gates/*.py`, which remain in the Python
+//! source as the human-readable reference these tables are checked against,
+//! entry-for-entry, by `tests/test_rule_tables.py` (via
+//! `evolve_single_gate_debug` below). `tests/test_backends.py` covers
+//! correctness at the full-circuit level instead (random circuits vs. PennyLane
+//! directly).
 //!
 //! Pauli-word representation: each x/z plane is a fixed-size `[u64; NW]`
 //! array (one bit per qubit, `NW` 64-bit words), where `NW` is chosen per

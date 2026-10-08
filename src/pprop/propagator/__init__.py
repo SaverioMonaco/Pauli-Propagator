@@ -5,8 +5,7 @@ the expectation value of an observable.
 
 Propagation itself (the Heisenberg-picture evolution of each observable
 backward through the circuit's gates) runs entirely in the Rust extension
-``pprop_rs``. pprop has no pure-Python propagation path anymore; see
-``native/pprop_rs``.
+``pprop_rs``. pprop has no pure-Python propagation path anymore.
 
 >>> from pprop import Propagator
 >>> import pennylane as qml
