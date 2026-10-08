@@ -84,8 +84,62 @@ struct GateSpec<const NW: usize> {
     kind: u8,
     wire0: u32,
     wire1: i64, // -1 unless two-qubit
-    param: i64, // -1 unless parametrised
+    param: i64, // -1 unless read from a trainable parameter slot
+    // Constant angle of a rotation/controlled-rotation gate that was given a
+    // plain float rather than a trainable index (e.g. `qml.RY(np.pi, wires=0)`).
+    // `None` for trainable and non-parametrised gates. See `fixed_sin_cos`.
+    fixed: Option<f64>,
     wire_mask: [u64; NW],
+}
+
+// ---------------------------------------------------------------------
+// Fixed-angle folding
+// ---------------------------------------------------------------------
+//
+// A rotation given a constant angle contributes constant factors, not
+// trigonometric ones, so - exactly like the T gate's 1/sqrt(2) - they are
+// multiplied straight into each term's coefficient instead of being pushed
+// onto its sin/cos index lists. Two things follow:
+//
+//   * a branch whose folded factor is zero is dropped before it is ever
+//     created. At any multiple of pi/2 one of sin/cos vanishes, so a fixed
+//     RY(pi) or CRX(pi) splits nothing and the term count stays what it
+//     would be without the gate;
+//   * a fixed gate no longer counts towards the `k2` frequency cutoff, which
+//     makes it consistent with T (a constant is a constant).
+//
+// `FOLD_SNAP` is the one judgement call: `f64::sin(PI)` is 1.22e-16, not 0,
+// and without snapping to a true zero the dead branch survives carrying
+// float noise. The worst case of snapping is dropping a term of size
+// |coeff| * 1e-12 per snapped factor, before accumulation across terms/gates.
+// This also snaps genuinely nonzero factors near quarter turns. It is an
+// approximation, not a test that an angle is exactly Clifford; large
+// observable coefficients amplify its absolute error (see propagate docs).
+
+const FOLD_SNAP: f64 = 1e-12;
+
+#[inline]
+fn snap(v: f64) -> f64 {
+    if v.abs() < FOLD_SNAP { 0.0 } else { v }
+}
+
+/// `(sin(theta), cos(theta))` of a fixed angle, with exact zeros at the
+/// quarter turns. Callers pass the angle in whatever convention the gate's
+/// rule table is written in (the full angle for RX/RY/RZ, the half angle
+/// for CRX/CRY/CRZ - see `controlledrotation.py`).
+fn fixed_sin_cos(theta: f64) -> (f64, f64) {
+    let (s, c) = theta.sin_cos();
+    (snap(s), snap(c))
+}
+
+/// Multiply every term's coefficient by a constant, in place.
+fn scale_terms(mut terms: Vec<CoeffTerm>, factor: f64) -> Vec<CoeffTerm> {
+    if factor != 1.0 {
+        for t in terms.iter_mut() {
+            t.0 *= factor;
+        }
+    }
+    terms
 }
 
 // ---------------------------------------------------------------------
@@ -531,9 +585,10 @@ fn crz_rule(code: u8) -> Option<CRRule> {
 
 /// RX/RY/RZ shape: commuting Pauli passes through; anti-commuting Pauli
 /// splits into a cos(theta) branch (same word) and a sign*sin(theta) branch
-/// (new word).
+/// (new word). With a fixed angle the two factors are constants folded into
+/// the coefficients, and a branch whose factor is zero is not created.
 fn evolve_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, wire: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<(u8, i8)>,
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
@@ -542,6 +597,21 @@ fn evolve_rotation<const NW: usize>(
         None => insert_or_extend(map, (x, z), terms),
         Some((out_label, sign)) => {
             let new_key = set_label(x, z, wire, out_label);
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta);
+                let s = sign as f64 * s;
+                if c != 0.0 && s != 0.0 {
+                    let cos_terms = scale_terms(terms.clone(), c);
+                    insert_or_extend(map, (x, z), cos_terms);
+                    insert_or_extend(map, new_key, scale_terms(terms, s));
+                } else if c != 0.0 {
+                    insert_or_extend(map, (x, z), scale_terms(terms, c));
+                } else if s != 0.0 {
+                    insert_or_extend(map, new_key, scale_terms(terms, s));
+                }
+                // sin and cos cannot both snap to zero; nothing to do otherwise.
+                return;
+            }
             let p = param as u32;
             let cos_terms: Vec<CoeffTerm> = terms
                 .iter()
@@ -650,8 +720,11 @@ fn evolve_controlled<const NW: usize>(
 /// CRX/CRY/CRZ shape: commuting word passes through; otherwise up to 4
 /// output words, each scaling every existing term by a constant coefficient
 /// and appending 0-2 copies of the gate's parameter index to sin_idx/cos_idx.
+/// With a fixed angle those sin/cos powers are evaluated at the *half* angle
+/// (the rule tables are written in theta/2, see `controlledrotation.py`) and
+/// folded into the coefficient; branches whose factor is zero are dropped.
 fn evolve_controlled_rotation<const NW: usize>(
-    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32, param: i64,
+    x: [u64; NW], z: [u64; NW], terms: Vec<CoeffTerm>, control: u32, target: u32, param: i64, fixed: Option<f64>,
     rule: fn(u8) -> Option<CRRule>,
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
@@ -661,6 +734,19 @@ fn evolve_controlled_rotation<const NW: usize>(
     match rule(code) {
         None => insert_or_extend(map, (x, z), terms),
         Some(branches) => {
+            if let Some(theta) = fixed {
+                let (s, c) = fixed_sin_cos(theta / 2.0);
+                for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
+                    let factor = coeff * s.powi(n_sin as i32) * c.powi(n_cos as i32);
+                    if factor == 0.0 {
+                        continue;
+                    }
+                    let (nx, nz) = set_label(x, z, control, out_c);
+                    let (nx, nz) = set_label(nx, nz, target, out_t);
+                    insert_or_extend(map, (nx, nz), scale_terms(terms.clone(), factor));
+                }
+                return;
+            }
             let p = param as u32;
             for &(out_c, out_t, coeff, n_sin, n_cos) in branches {
                 let (nx, nz) = set_label(x, z, control, out_c);
@@ -700,9 +786,9 @@ fn evolve_one_gate<const NW: usize>(
     map: &mut FxHashMap<PauliKey<NW>, Vec<CoeffTerm>>,
 ) {
     match gate.kind {
-        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, rx_rule, map),
-        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, ry_rule, map),
-        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, rz_rule, map),
+        RX => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rx_rule, map),
+        RY => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, ry_rule, map),
+        RZ => evolve_rotation(x, z, terms, gate.wire0, gate.param, gate.fixed, rz_rule, map),
         H => evolve_clifford1q(x, z, terms, gate.wire0, h_rule, map),
         S => evolve_clifford1q(x, z, terms, gate.wire0, s_rule, map),
         SX => evolve_clifford1q(x, z, terms, gate.wire0, sx_rule, map),
@@ -711,9 +797,9 @@ fn evolve_one_gate<const NW: usize>(
         CNOT => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cnot_rule, map),
         CY => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cy_rule, map),
         CZ => evolve_controlled(x, z, terms, gate.wire0, gate.wire1 as u32, cz_rule, map),
-        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crx_rule, map),
-        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, cry_rule, map),
-        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, crz_rule, map),
+        CRX => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crx_rule, map),
+        CRY => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, cry_rule, map),
+        CRZ => evolve_controlled_rotation(x, z, terms, gate.wire0, gate.wire1 as u32, gate.param, gate.fixed, crz_rule, map),
         _ => unreachable!("unknown gate kind {}", gate.kind),
     }
 }
@@ -818,6 +904,7 @@ fn propagate_batch_impl<const NW: usize>(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -838,6 +925,7 @@ fn propagate_batch_impl<const NW: usize>(
             wire0: gate_wire0[i],
             wire1: gate_wire1[i],
             param: gate_param[i],
+            fixed: gate_fixed[i],
             wire_mask,
         });
     }
@@ -904,7 +992,7 @@ macro_rules! dispatch_nw {
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits,
-    gate_kind, gate_wire0, gate_wire1, gate_param,
+    gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
     k1, k2, coeff_threshold,
     use_dead_qubit_pruner, use_xy_weight_pruner,
     paulidicts,
@@ -916,6 +1004,7 @@ fn propagate_batch(
     gate_wire0: Vec<u32>,
     gate_wire1: Vec<i64>,
     gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
     k1: i64,
     k2: i64,
     coeff_threshold: f64,
@@ -927,7 +1016,7 @@ fn propagate_batch(
     dispatch_nw!(
         nw, num_qubits, propagate_batch_impl,
         (
-            gate_kind, gate_wire0, gate_wire1, gate_param,
+            gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
             k1, k2, coeff_threshold, use_dead_qubit_pruner, use_xy_weight_pruner,
             paulidicts,
         )
@@ -939,6 +1028,7 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     wire0: u32,
     wire1: i64,
     param: i64,
+    fixed: Option<f64>,
     x: &[u64],
     z: &[u64],
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
@@ -948,7 +1038,7 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
     if wire1 >= 0 {
         set_wire_bit(&mut wire_mask, wire1 as u32);
     }
-    let gate = GateSpec::<NW> { kind, wire0, wire1, param, wire_mask };
+    let gate = GateSpec::<NW> { kind, wire0, wire1, param, fixed, wire_mask };
     let mut map: FxHashMap<PauliKey<NW>, Vec<CoeffTerm>> = FxHashMap::default();
     evolve_one_gate(&gate, words_to_array::<NW>(x), words_to_array::<NW>(z), terms, &mut map);
     map.into_iter()
@@ -963,8 +1053,11 @@ fn evolve_single_gate_debug_impl<const NW: usize>(
 /// `propagate_batch`). Used by `tests/test_rule_tables.py` to cross-check
 /// every gate's `rule` dict in `pprop/gates/*.py` directly against this
 /// file's rule tables, term-for-term, independent of whether the output
-/// happens to land in the Z/I subspace.
+/// happens to land in the Z/I subspace. `fixed` is the constant angle of a
+/// non-trainable rotation (see `GateSpec::fixed`); leave it `None` for a
+/// trainable one.
 #[pyfunction]
+#[pyo3(signature = (num_qubits, kind, wire0, wire1, param, x, z, terms, fixed = None))]
 #[allow(clippy::too_many_arguments)]
 fn evolve_single_gate_debug(
     num_qubits: u32,
@@ -975,11 +1068,12 @@ fn evolve_single_gate_debug(
     x: Vec<u64>,
     z: Vec<u64>,
     terms: Vec<(f64, Vec<u32>, Vec<u32>)>,
+    fixed: Option<f64>,
 ) -> PyResult<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>> {
     let nw = words_needed(num_qubits);
     Ok(dispatch_nw!(
         nw, num_qubits, evolve_single_gate_debug_impl,
-        (kind, wire0, wire1, param, &x, &z, terms)
+        (kind, wire0, wire1, param, fixed, &x, &z, terms)
     ))
 }
 
