@@ -6,8 +6,8 @@ in ``native/pprop_rs/src/lib.rs``) via ``pprop_rs.evolve_single_gate_debug``.
 Why this exists: the Python ``rule`` dicts are never executed at propagation
 time (that's all done by their Rust counterparts) and were, until this test
 existed, never actually checked against the Rust tables by anything
-automated - only by a one-time manual pass during the Python-to-Rust port
-(see ``personal/rust_port.tex``). Nothing stopped `lib.rs` and the matching
+automated - only by a one-time manual pass during the Python-to-Rust port.
+Nothing stopped `lib.rs` and the matching
 ``pprop/gates/*.py`` dict from silently drifting apart. This test makes that
 claim true: for every explicit entry in every gate's ``rule`` dict, it builds
 the single input Pauli word that entry describes, evolves it through the
