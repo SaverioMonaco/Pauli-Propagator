@@ -4,8 +4,7 @@ Verifies Propagator's (sole, Rust-backed) propagation + evaluation path
 against PennyLane's own param-shift gradient, across the full gate set
 (H/S/SX/T, RX/RY/RZ, SWAP, CNOT/CY/CZ). This is what used to be a
 three-backend cross-check ("standard"/"sparse"/"vmap") before those were
-removed in favour of the single Rust implementation. See
-personal/rust_port.tex for why.
+removed in favour of the single Rust implementation.
 """
 import random
 from collections import Counter

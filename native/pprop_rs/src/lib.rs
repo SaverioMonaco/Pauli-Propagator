@@ -1,6 +1,6 @@
 //! Rust implementation of pprop's Heisenberg propagation core.
 //!
-//! This is the *only* propagation backend in this fork of pprop (see the
+//! This is the *only* propagation backend in pprop (see the
 //! project README / paper appendix for why the pure-Python
 //! `heisenberg()`/`PauliDict` implementation was removed rather than kept
 //! alongside this one). It covers every gate in `pprop.gates`

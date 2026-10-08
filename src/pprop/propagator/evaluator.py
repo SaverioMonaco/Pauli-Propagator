@@ -8,7 +8,7 @@ Provides:
   against a single lookup table, with no padding.
 - :func:`make_sparse_evaluator` -- compiles :data:`CoeffTerms` into fast numeric
   callables built on the ragged arrays. This is the only evaluator
-  this fork keeps. It was measured ~6x faster than the removed dense
+  pprop keeps. It was measured ~6x faster than the removed dense
   ("standard") evaluator at typical k1/k2 truncation levels, and the removed
   JAX/vmap evaluator was consistently slower on CPU (see git history and the
   paper appendix for the old benchmarks that motivated dropping both). The

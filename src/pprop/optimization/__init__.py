@@ -24,9 +24,8 @@ Both optimisers call :meth:`~pprop.propagator.Propagator.eval_and_grad` to
 obtain a value/Jacobian pair, which is plain NumPy end to end since
 propagation itself runs in the Rust extension ``pprop_rs`` (see
 ``pprop.propagator``). There's no host<->device transfer or JAX/GPU path in
-this fork: the old ``adam_gpu``/``backend="vmap"`` combination was removed
-along with the other propagation/evaluator backends (see
-``personal/rust_port.tex``).
+pprop: the old ``adam_gpu``/``backend="vmap"`` combination was removed
+along with the other propagation/evaluator backends.
 
 Choosing between them
 ---------------------
