@@ -179,3 +179,65 @@ def test_observable_words_are_truncated_after_the_first_gate_step():
     prop.propagate()
     assert _as_multiset(prop.exprs[0]) == _as_multiset(expected[0])
     assert _as_multiset(prop.exprs[0]) == Counter({(1.0, (), (0,)): 1})
+
+
+def _brick_circuit(side, layers):
+    """RX layer, then CNOT bricks and RY layers on a side x side grid, measuring
+    a transverse-field Ising Hamiltonian; large enough to run multithreaded."""
+    n = side * side
+    coeffs, obs = [], []
+    for x in range(side):
+        for y in range(side):
+            i = x * side + y
+            if y < side - 1:
+                coeffs.append(-1.0 / n)
+                obs.append(qml.PauliZ(i) @ qml.PauliZ(i + 1))
+            if x < side - 1:
+                coeffs.append(-1.0 / n)
+                obs.append(qml.PauliZ(i) @ qml.PauliZ(i + side))
+            coeffs.append(-1.0 / n)
+            obs.append(qml.PauliX(i))
+    hamiltonian = qml.Hamiltonian(coeffs, obs)
+
+    def circuit(params):
+        k = 0
+        for q in range(n):
+            qml.RX(params[k], wires=q)
+            k += 1
+        for d in range(layers):
+            for x in range(side):
+                for y in range(d % 2, side - 1, 2):
+                    qml.CNOT(wires=[x * side + y, x * side + y + 1])
+            for q in range(n):
+                qml.RY(params[k], wires=q)
+                k += 1
+        return qml.expval(hamiltonian)
+
+    return circuit
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_expression_does_not_depend_on_thread_count(seed):
+    rng = random.Random(seed)
+    circuit = _random_circuit(rng, rng.choice([4, 5]), rng.choice([2, 3]))
+    k1, k2 = rng.choice([None, 3]), rng.choice([None, 4])
+    exprs = []
+    for n_threads in (1, 3, 8):
+        prop = Propagator(circuit, k1=k1, k2=k2)
+        prop.propagate(use_dead_qubit_pruner=True, use_xy_weight_pruner=True,
+                       n_threads=n_threads)
+        exprs.append(prop.exprs)
+    # Not just the same terms: the same list, in the same order.
+    assert exprs[0] == exprs[1] == exprs[2]
+
+
+def test_threaded_propagation_of_a_larger_circuit():
+    circuit = _brick_circuit(6, 3)
+    exprs = []
+    for n_threads in (1, 4):
+        prop = Propagator(circuit)
+        prop.propagate(use_dead_qubit_pruner=True, use_xy_weight_pruner=True,
+                       n_threads=n_threads)
+        exprs.append(prop.exprs)
+    assert exprs[0] == exprs[1]
+    assert len(exprs[0][0]) == 4356
