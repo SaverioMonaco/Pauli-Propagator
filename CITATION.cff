@@ -6,8 +6,10 @@ authors:
   orcid: "https://orcid.org/0000-0001-8784-5011"
 - family-names: "Lipponen"
   given-names: "Aapo"
+- family-names: "Muff"
+  given-names: "Jake"
 title: "Pauli-Propagator"
-version: 3.1.0
+version: 3.4.0
 doi: 10.5281/zenodo.21650428
-date-released: 2026-09-28
+date-released: 2026-10-26
 url: "https://github.com/SaverioMonaco/Pauli-Propagator"

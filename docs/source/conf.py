@@ -20,10 +20,10 @@ sys.path.insert(0, os.path.abspath('../../src'))
 
 project = 'Pauli-Propagator'
 copyright = '2026, Saverio Monaco'
-author = 'Saverio Monaco'
+author = 'Saverio Monaco, Aapo Lipponen, Jake Muff'
 
 # The full version, including alpha/beta/rc tags
-release = '3.1.0'
+release = '3.4.0'
 
 
 # -- General configuration ---------------------------------------------------
