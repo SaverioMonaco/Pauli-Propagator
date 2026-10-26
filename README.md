@@ -93,6 +93,19 @@ This pulls in the Rust extension `pprop_rs` as a prebuilt wheel (Linux x86_64/aa
 macOS arm64, Windows x64; Python 3.12+). On other platforms pip builds it from
 source, which needs a Rust toolchain ([rustup](https://rustup.rs/)).
 
+### Running on IBM hardware (optional)
+
+`pprop.qasm` exports a trained circuit to OpenQASM 3 with no extra
+dependencies. To load it into Qiskit (`pprop.qasm.to_qiskit`) and run it on
+IBM Quantum devices, install the `qiskit` extra, which adds `qiskit`,
+`qiskit-qasm3-import` and `qiskit-ibm-runtime`:
+
+```bash
+pip install "pauli-propagator[qiskit]"
+```
+
+For a development install, use `pip install -e ".[qiskit]"` in the last step below.
+
 ### Development install
 
 ```bash
