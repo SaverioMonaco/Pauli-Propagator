@@ -35,6 +35,11 @@ def get_random_ansatz():
         q0, q1 = random.sample(range(num_qubits), 2)
         layers.append((single_gates, (gate, q0, q1)))
 
+    # Every single-qubit gate can come out non-parametric, leaving a circuit
+    # with no parameters, which param_shift cannot differentiate. Force one.
+    if not any(gate in sqp_gates for single_gates, _ in layers for gate, _ in single_gates):
+        layers[0][0][0] = (random.choice(sqp_gates), 0)
+
     def ansatz(params):
         param_idx = 0
         for single_gates, (tq_gate, q0, q1) in layers:
@@ -506,22 +511,6 @@ def test_fixed_value_gates_do_not_count_towards_k2():
         assert np.isclose(prop(np.array([theta]))[0], np.cos(0.3) * np.cos(theta), atol=1e-12)
 
 
-# %%
-test_propagator_agrees_with_qml()
-test_eval_n_jobs_matches_single_threaded()
-test_fixed_value_parameter_is_not_aliased()
-test_controlled_rotations_agree_with_qml()
-test_bind_affine_reparametrisation_agrees_with_qml()
-test_propagator_beyond_64_qubits()
-test_fixed_value_gates_agree_with_qml()
-test_gradient_at_zeros_of_sin_and_cos()
-test_repeated_parameter_powers_agree_with_qml()
-test_fixed_rotation_at_quarter_turn_kills_its_branch()
-test_fixed_value_controlled_rotations_agree_with_qml()
-test_fixed_value_shared_between_rotation_and_controlled_rotation()
-test_fixed_value_gates_do_not_count_towards_k2()
-
-
 @pytest.mark.parametrize("angle", [5e-13, -5e-13, 2e-12, -2e-12])
 def test_fixed_angle_snap_boundary_and_coefficient_scale(angle):
     """The snap is a per-factor approximation, not an absolute error bound."""
@@ -608,5 +597,24 @@ def test_truncation_can_empty_an_expression():
     assert np.all(grad == 0.0)
 
 
-test_uneven_support_widths_agree_with_qml()
-test_truncation_can_empty_an_expression()
+# %%
+# Running the file as a script (or cell by cell) still runs every check;
+# under pytest these calls are skipped so a failure is reported per test.
+if __name__ == "__main__":
+    test_propagator_agrees_with_qml()
+    test_eval_n_jobs_matches_single_threaded()
+    test_fixed_value_parameter_is_not_aliased()
+    test_controlled_rotations_agree_with_qml()
+    test_bind_affine_reparametrisation_agrees_with_qml()
+    test_propagator_beyond_64_qubits()
+    test_fixed_value_gates_agree_with_qml()
+    test_gradient_at_zeros_of_sin_and_cos()
+    test_repeated_parameter_powers_agree_with_qml()
+    test_fixed_rotation_at_quarter_turn_kills_its_branch()
+    test_fixed_value_controlled_rotations_agree_with_qml()
+    test_fixed_value_shared_between_rotation_and_controlled_rotation()
+    test_fixed_value_gates_do_not_count_towards_k2()
+    for angle in (5e-13, -5e-13, 2e-12, -2e-12):
+        test_fixed_angle_snap_boundary_and_coefficient_scale(angle)
+    test_uneven_support_widths_agree_with_qml()
+    test_truncation_can_empty_an_expression()
