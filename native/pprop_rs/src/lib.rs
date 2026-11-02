@@ -671,16 +671,18 @@ fn mask_is_zero<const NW: usize>(a: &[u64; NW]) -> bool {
 }
 
 /// Merge `terms` into `key`'s coefficient. A new word takes ownership of the
-/// vector as-is; only a word that already exists pays for a copy.
+/// vector as-is; only a word that already exists pays for a copy. Returns
+/// whether the word already existed.
 fn insert_or_extend<const NW: usize>(
     map: &mut FxHashMap<PauliKey<NW>, Vec<Term>>,
     key: PauliKey<NW>,
     mut terms: Vec<Term>,
-) {
+) -> bool {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
         Entry::Vacant(slot) => {
             slot.insert(terms);
+            false
         }
         Entry::Occupied(mut slot) => {
             let existing = slot.get_mut();
@@ -688,8 +690,24 @@ fn insert_or_extend<const NW: usize>(
                 std::mem::swap(existing, &mut terms);
             }
             existing.append(&mut terms);
+            true
         }
     }
+}
+
+/// Sum a word's terms into one, for a propagation in which every term is a
+/// plain number (`mono == ROOT`). The terms are summed in order of value, so
+/// the result does not depend on the order they were appended in, which
+/// changes with the number of threads. Returns `false` when the sum is
+/// exactly zero and the word should be dropped.
+fn sum_scalar_terms(terms: &mut Vec<Term>) -> bool {
+    if terms.len() > 1 {
+        terms.sort_unstable_by(|a, b| a.coeff.total_cmp(&b.coeff));
+        let sum: f64 = terms.iter().map(|t| t.coeff).sum();
+        terms.truncate(1);
+        terms[0].coeff = sum;
+    }
+    terms.first().is_some_and(|t| t.coeff != 0.0)
 }
 
 // ---------------------------------------------------------------------
@@ -1339,14 +1357,31 @@ fn evolve_shard<const NW: usize>(
 }
 
 /// Second half of a layer, for one shard: merge in the words every shard
-/// produced for it. Returns their support.
-fn merge_shard<const NW: usize>(shard: &mut WordMap<NW>, incoming: Vec<Emitted<NW>>) -> [u64; NW] {
+/// produced for it. With `scalar`, every word reached more than once ends
+/// up with one summed term. Returns their support.
+fn merge_shard<const NW: usize>(
+    shard: &mut WordMap<NW>,
+    incoming: Vec<Emitted<NW>>,
+    scalar: bool,
+) -> [u64; NW] {
     let mut active = [0u64; NW];
+    let mut extended: Vec<PauliKey<NW>> = Vec::new();
     for batch in incoming {
         for (key, terms) in batch {
             mask_or_assign(&mut active, &key.0);
             mask_or_assign(&mut active, &key.1);
-            insert_or_extend(shard, key, terms);
+            if insert_or_extend(shard, key, terms) && scalar {
+                extended.push(key);
+            }
+        }
+    }
+    // A key can be listed more than once; after its first visit it holds a
+    // single term (or is gone), so later visits change nothing.
+    for key in extended {
+        if let Some(terms) = shard.get_mut(&key) {
+            if !sum_scalar_terms(terms) {
+                shard.remove(&key);
+            }
         }
     }
     active
@@ -1393,11 +1428,18 @@ fn run_all<T: Send, R: Send>(items: Vec<T>, parallel: bool, f: impl Fn(T) -> R +
 ///   gate is about to act on it, which rejects it exactly when some earlier
 ///   check would have. A dead word that no gate touches again just sits in
 ///   the map; it has an X/Y somewhere, so it never reaches the expectation.
+///
+/// With `scalar` (no trainable gate and no sin/cos factor in the observable,
+/// so every term stays `mono == ROOT`), the terms a word collects are summed
+/// into one after every layer: the work then scales with the number of
+/// distinct words, not of paths. Without it no term is ever compared, so a
+/// circuit with trainable parameters pays nothing for this.
 fn heisenberg_one<const NW: usize>(
     circuit: &Circuit<NW>,
     layers: &[Layer<NW>],
     mut shards: Vec<WordMap<NW>>,
     arenas: &mut [Monomials],
+    scalar: bool,
 ) -> Vec<CoeffTerm> {
     let n_shards = shards.len();
     let mut active_mask = [0u64; NW];
@@ -1456,7 +1498,7 @@ fn heisenberg_one<const NW: usize>(
         let merged = run_all(
             shards.iter_mut().zip(incoming).collect(),
             parallel,
-            |(shard, batches)| merge_shard(shard, batches),
+            |(shard, batches)| merge_shard(shard, batches, scalar),
         );
         for mask in &merged {
             mask_or_assign(&mut next_active, mask);
@@ -1549,9 +1591,14 @@ fn propagate_batch_impl<const NW: usize>(
         use_xy_weight_pruner,
     };
     let n_shards = n_threads.clamp(1, MAX_ARENAS);
+    // Only trainable gates push sin/cos factors (fixed ones fold theirs
+    // into the coefficient), so without them every term stays a number.
+    let all_fixed = reversed.iter().all(|g| g.param < 0);
 
     let mut results = Vec::with_capacity(paulidicts.len());
     for pd_spec in paulidicts {
+        let scalar = all_fixed
+            && pd_spec.iter().all(|(_, _, _, s, c)| s.is_empty() && c.is_empty());
         let mut arenas: Vec<Monomials> = (0..n_shards)
             .map(|a| Monomials::new(a, sine_order))
             .collect();
@@ -1564,7 +1611,12 @@ fn propagate_batch_impl<const NW: usize>(
                 .or_default()
                 .push(term);
         }
-        results.push(heisenberg_one(&circuit, &layers, shards, &mut arenas));
+        if scalar {
+            for shard in shards.iter_mut() {
+                shard.retain(|_, terms| sum_scalar_terms(terms));
+            }
+        }
+        results.push(heisenberg_one(&circuit, &layers, shards, &mut arenas, scalar));
     }
 
     Ok(results)
