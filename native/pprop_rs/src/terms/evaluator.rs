@@ -5,6 +5,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyByteArray;
+use crate::pybuf::*;
 
 /// The CSR layout `pprop.propagator.evaluator.build_ragged_arrays` builds
 /// (coefficients, lookup-table index of every factor, factors per term), as
@@ -311,12 +312,4 @@ impl Evaluator {
         }
         Ok(values)
     }
-}
-
-fn read_f64(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
-    PyBuffer::<f64>::get_bound(obj)?.to_vec(obj.py())
-}
-
-fn read_u32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-    PyBuffer::<u32>::get_bound(obj)?.to_vec(obj.py())
 }

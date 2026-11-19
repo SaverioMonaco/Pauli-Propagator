@@ -24,11 +24,12 @@ use pyo3::prelude::*;
 mod gates;
 mod pauli;
 mod pruning;
+mod pybuf;
 mod tape;
 mod terms;
 mod threads;
 use pauli::*;
-use tape::tape_debug_impl;
+use tape::{compile_tapes_impl, tape_debug_impl, TapeProgram};
 use terms::*;
 
 /// Dispatches to the `$f::<NW>` monomorphization matching `$nw` (a
@@ -132,6 +133,28 @@ fn evolve_single_gate_debug(
     ))
 }
 
+/// Compile each observable into a `TapeProgram` (one-qubit rotations so far).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn compile_tapes(
+    py: Python<'_>,
+    num_qubits: u32,
+    gate_kind: Vec<u8>,
+    gate_wire0: Vec<u32>,
+    gate_wire1: Vec<i64>,
+    gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
+    paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
+) -> PyResult<Vec<TapeProgram>> {
+    let nw = words_needed(num_qubits);
+    py.allow_threads(move || {
+        dispatch_nw!(
+            nw, num_qubits, compile_tapes_impl,
+            (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts)
+        )
+    })
+}
+
 /// Test-only: the tape of one observable as plain lists (see `tape::tape_debug_impl`).
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -158,5 +181,7 @@ fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Evaluator>()?;
     m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
     m.add_function(wrap_pyfunction!(tape_debug, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_tapes, m)?)?;
+    m.add_class::<TapeProgram>()?;
     Ok(())
 }
