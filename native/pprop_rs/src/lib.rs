@@ -1591,9 +1591,14 @@ fn propagate_batch_impl<const NW: usize>(
         use_xy_weight_pruner,
     };
     let n_shards = n_threads.clamp(1, MAX_ARENAS);
+    // Only trainable gates push sin/cos factors (fixed ones fold theirs
+    // into the coefficient), so without them every term stays a number.
+    let all_fixed = reversed.iter().all(|g| g.param < 0);
 
     let mut results = Vec::with_capacity(paulidicts.len());
     for pd_spec in paulidicts {
+        let scalar = all_fixed
+            && pd_spec.iter().all(|(_, _, _, s, c)| s.is_empty() && c.is_empty());
         let mut arenas: Vec<Monomials> = (0..n_shards)
             .map(|a| Monomials::new(a, sine_order))
             .collect();
@@ -1606,7 +1611,12 @@ fn propagate_batch_impl<const NW: usize>(
                 .or_default()
                 .push(term);
         }
-        results.push(heisenberg_one(&circuit, &layers, shards, &mut arenas, false));
+        if scalar {
+            for shard in shards.iter_mut() {
+                shard.retain(|_, terms| sum_scalar_terms(terms));
+            }
+        }
+        results.push(heisenberg_one(&circuit, &layers, shards, &mut arenas, scalar));
     }
 
     Ok(results)

@@ -299,6 +299,12 @@ class Propagator:
         Results under frequency truncation can differ from earlier revisions.
         With ``k2_mode="sine"`` only sin factors count toward ``k2``.
 
+        If no gate is trainable (``num_params == 0``), every term is a plain
+        number, so the terms each Pauli word collects are summed into one
+        after every layer. The cost then grows with the number of distinct
+        words instead of the number of paths. Circuits with at least one
+        trainable gate are propagated exactly as before.
+
         Parameters
         ----------
         use_dead_qubit_pruner : bool, optional
