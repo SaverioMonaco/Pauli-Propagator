@@ -52,7 +52,6 @@ pub(crate) enum Angle {
     /// A trainable parameter: its index in the parameter vector.
     Param(u32),
     /// A fixed angle, already turned into its cosine and sine.
-    #[allow(dead_code)] // compiled from A7 on
     Fixed { cos: f64, sin: f64 },
 }
 
@@ -81,8 +80,8 @@ pub(crate) struct Tape {
 }
 
 /// What `tape_debug` returns to Python: `n_boxes`, `init`, the steps as
-/// `("rotate", parameter index, first pair, last pair)` or
-/// `("negate", -1, first, last)`, the pairs, the negated boxes, the readout,
+/// `("rotate", parameter index, first pair, last pair)`,
+/// `("fixed", -1, first pair, last pair)` or `("negate", -1, first, last)`, the pairs, the negated boxes, the readout,
 /// the word of every box as `(x words, z words)`, and whether each box is
 /// still alive at the end (false once dropped by k1).
 pub(crate) type TapeDebug = (
@@ -119,7 +118,7 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
         .iter()
         .map(|s| match *s {
             Step::Rotate { angle: Angle::Param(p), first, last } => ("rotate", p as i64, first, last),
-            Step::Rotate { angle: Angle::Fixed { .. }, .. } => unreachable!("fixed angles come in A7"),
+            Step::Rotate { angle: Angle::Fixed { .. }, first, last } => ("fixed", -1, first, last),
             Step::Negate { first, last } => ("negate", -1, first, last),
         })
         .collect();

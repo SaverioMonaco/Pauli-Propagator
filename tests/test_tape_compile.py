@@ -186,8 +186,13 @@ def test_xy_weight_pruner():
     assert t["words"] == ["YY", "ZY"] and t["steps"] == [("rotate", 0, 0, 1)]
 
 
+def test_fixed_angle_step():
+    # A fixed RX(0.3): the same pair as a trainable one, in a "fixed" step.
+    out = pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [-1], [0.3], [([0], [1], 1.0, [], [])])
+    steps, pairs = out[2], out[3]
+    assert steps == [("fixed", -1, 0, 1)] and pairs == [(0, 1)]
+
+
 def test_gates_not_supported_yet():
     with pytest.raises(ValueError, match="cannot compile gate kind"):
         pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([0], [1], 1.0, [], [])])
-    with pytest.raises(ValueError, match="fixed angle"):
-        pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [-1], [0.3], [([0], [1], 1.0, [], [])])

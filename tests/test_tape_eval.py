@@ -2,7 +2,7 @@
 statevectors and against the sum-of-terms engine.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
+or fixed angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
 truncation (checked against the sum-of-terms engine: a statevector cannot
 truncate) and the two exact pruners.
 """
@@ -31,28 +31,32 @@ def obs_spec(observable):
 
 
 def with_params(gates):
-    """gates: [(name, wires)] in circuit order, wires a qubit or a (control,
-    target) pair -> [(name, wires, param)], the rotations numbered 0, 1, ..."""
+    """gates: [(name, wires)] or [(name, wires, fixed angle)] in circuit order,
+    wires a qubit or a (control, target) pair -> [(name, wires, param, fixed)]:
+    the trainable rotations numbered 0, 1, ...; param -1 for the others."""
     out, p = [], 0
-    for g, w in gates:
-        if g in ROTATIONS:
-            out.append((g, w, p))
+    for gate in gates:
+        g, w = gate[0], gate[1]
+        if len(gate) == 3:
+            out.append((g, w, -1, float(gate[2])))
+        elif g in ROTATIONS:
+            out.append((g, w, p, None))
             p += 1
         else:
-            out.append((g, w, -1))
+            out.append((g, w, -1, None))
     return out, p
 
 
 def tapes(n, gates, observables, k1=-1, dead=False, xy=False):
     gates, _ = with_params(gates)
-    wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
+    wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _, _ in gates]
     return pprop_rs.compile_tapes(
         n,
-        [_GATE_KIND[g] for g, _, _ in gates],
+        [_GATE_KIND[g] for g, _, _, _ in gates],
         [w0 for w0, _ in wires],
         [w1 for _, w1 in wires],
-        [p for _, _, p in gates],
-        [None] * len(gates),
+        [p for _, _, p, _ in gates],
+        [f for _, _, _, f in gates],
         [obs_spec(o) for o in observables],
         k1,
         dead,
@@ -71,10 +75,12 @@ def pauli_op(word):
 
 def apply(gates, theta):
     gates, _ = with_params(gates)
-    for g, w, p in gates:
+    for g, w, p, fixed in gates:
         wires = list(w) if isinstance(w, tuple) else w
         if p >= 0:
             getattr(qml, g)(theta[p], wires=wires)
+        elif fixed is not None:
+            getattr(qml, g)(fixed, wires=wires)
         else:
             getattr(qml, g)(wires=wires)
 
@@ -271,6 +277,50 @@ def test_pruners_on_brickwork():
     assert tape_value(pruned, theta) == pytest.approx(tape_value(full, theta), abs=1e-12)
     assert tape_value(pruned, theta) == pytest.approx(
         old_engine(gates, word, theta, k1=4, dead=True, xy=True), abs=1e-12)
+
+
+def random_fixed_case(seed):
+    """A random mixed circuit in which about half of the rotations get a fixed
+    angle, some of them exactly at quarter turns (where sin or cos is 0)."""
+    n, gates, observable, _ = random_case(seed)
+    rng = random.Random(1000 + seed)
+    quarter = [0.0, np.pi / 2, np.pi, -np.pi / 2]
+    out = []
+    for gate in gates:
+        if gate[0] in ROTATIONS and rng.random() < 0.5:
+            out.append((gate[0], gate[1], rng.choice(quarter) if rng.random() < 0.3 else rng.uniform(-np.pi, np.pi)))
+        else:
+            out.append(gate)
+    _, n_params = with_params(out)
+    theta = np.random.default_rng(seed).uniform(-np.pi, np.pi, n_params)
+    return n, out, observable, theta
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_fixed_angles_match_statevector_and_old_engine(seed):
+    n, gates, observable, theta = random_fixed_case(seed)
+    (program,) = tapes(n, gates, [observable])
+    value = tape_value(program, theta)
+    assert value == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
+    assert value == pytest.approx(old_engine(gates, observable, theta), abs=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_fixed_angles_with_k1_and_pruners_match_old_engine(seed):
+    n, gates, observable, theta = random_fixed_case(seed)
+    k1 = random.Random(seed).randint(1, n)
+    (program,) = tapes(n, gates, [observable], k1=k1, dead=True, xy=True)
+    assert tape_value(program, theta) == pytest.approx(
+        old_engine(gates, observable, theta, k1=k1, dead=True, xy=True), abs=1e-12)
+
+
+def test_all_fixed_circuit():
+    # No trainable gate at all: the tape takes empty angle arrays.
+    gates = [("RX", 0, 0.3), ("RY", 1, -1.2), ("CNOT", (0, 1)), ("RZ", 0, 2.0), ("RX", 1, np.pi / 2)]
+    observable = [("ZZ", 1.0), ("XI", 0.5)]
+    (program,) = tapes(2, gates, [observable])
+    empty = np.zeros(0)
+    assert program.eval(empty, empty) == pytest.approx(statevector(2, gates, observable, empty), abs=1e-12)
 
 
 def test_several_observables_and_several_thetas():

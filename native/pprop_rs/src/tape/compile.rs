@@ -252,12 +252,17 @@ fn rotation_step<const NW: usize>(
 ) -> Result<(), String> {
     let rule = rotation_rule(gate.kind)
         .ok_or_else(|| format!("the tape cannot compile gate kind {} yet", gate.kind))?;
-    if gate.param < 0 {
-        return Err(format!(
-            "the tape cannot compile a rotation (gate kind {}) with a fixed angle yet",
-            gate.kind
-        ));
-    }
+    // A trainable angle is read at evaluation time; a fixed one is turned into
+    // its cos and sin now, with the same snapping to exact zeros at quarter
+    // turns as the sum-of-terms engine (`fixed_sin_cos`).
+    let angle = if gate.param >= 0 {
+        Angle::Param(gate.param as u32)
+    } else if let Some(theta) = gate.fixed {
+        let (sin, cos) = fixed_sin_cos(theta);
+        Angle::Fixed { cos, sin }
+    } else {
+        return Err(format!("rotation (gate kind {}) has neither a parameter nor an angle", gate.kind));
+    };
     let step = tape.steps.len() as u32 + 1;
     let first = tape.pairs.len() as u32;
 
@@ -295,7 +300,7 @@ fn rotation_step<const NW: usize>(
 
     let last = tape.pairs.len() as u32;
     if last > first {
-        tape.steps.push(Step::Rotate { angle: Angle::Param(gate.param as u32), first, last });
+        tape.steps.push(Step::Rotate { angle, first, last });
     }
     Ok(())
 }
