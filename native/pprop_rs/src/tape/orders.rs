@@ -93,7 +93,7 @@ impl Tape {
         let mut new = vec![0.0; 4 * k];
         for step in &self.steps {
             match *step {
-                Step::Rotate { ref angle, first, last } => {
+                Step::Rotate { ref angle, first, last, sfirst, slast } => {
                     let (c, s, _) = cos_sin(angle, sins, coss);
                     let (sc, ss) = rotation_shifts(angle, self.sine_order);
                     for &[a, b] in &self.pairs[first as usize..last as usize] {
@@ -107,6 +107,17 @@ impl Tape {
                         for t in 0..k {
                             v[a + t] = c * shifted(&oa, t, sc) - s * shifted(&ob, t, ss);
                             v[b + t] = s * shifted(&oa, t, ss) + c * shifted(&ob, t, sc);
+                        }
+                    }
+                    // A single keeps its cos part: new a[t] = c·a[t − sc].
+                    for &b in &self.singles[sfirst as usize..slast as usize] {
+                        let b = b as usize * k;
+                        oa.copy_from_slice(&v[b..b + k]);
+                        if let Some(sv) = saved.as_deref_mut() {
+                            sv.extend_from_slice(&oa);
+                        }
+                        for t in 0..k {
+                            v[b + t] = c * shifted(&oa, t, sc);
                         }
                     }
                 }
@@ -169,7 +180,7 @@ impl Tape {
     pub(crate) fn value_and_grad_orders(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
         grad.iter_mut().for_each(|g| *g = 0.0);
         let k = self.orders();
-        let mut saved = Vec::with_capacity((2 * self.pairs.len() + 4 * self.blocks.len()) * k);
+        let mut saved = Vec::with_capacity((2 * self.pairs.len() + self.singles.len() + 4 * self.blocks.len()) * k);
         let v = self.forward_orders(sins, coss, Some(&mut saved));
         let value = self.readout_orders(&v);
 
@@ -184,9 +195,23 @@ impl Tape {
         let mut top = saved.len();
         for step in self.steps.iter().rev() {
             match *step {
-                Step::Rotate { ref angle, first, last } => {
+                Step::Rotate { ref angle, first, last, sfirst, slast } => {
                     let (c, s, p) = cos_sin(angle, sins, coss);
                     let (sc, ss) = rotation_shifts(angle, self.sine_order);
+                    for &b in self.singles[sfirst as usize..slast as usize].iter().rev() {
+                        let b = b as usize * k;
+                        top -= k;
+                        let oa = &saved[top..top + k];
+                        la.copy_from_slice(&lam[b..b + k]);
+                        if let Some(p) = p {
+                            for t in 0..k {
+                                grad[p] += la[t] * (-s * shifted(oa, t, sc));
+                            }
+                        }
+                        for u in 0..k {
+                            lam[b + u] = if u + sc < k { c * la[u + sc] } else { 0.0 };
+                        }
+                    }
                     for &[a, b] in self.pairs[first as usize..last as usize].iter().rev() {
                         let (a, b) = (a as usize * k, b as usize * k);
                         top -= 2 * k;

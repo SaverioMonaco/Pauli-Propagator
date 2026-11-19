@@ -23,7 +23,14 @@
 //! already θ/2, a fixed angle is halved here.
 //!
 //! The two exact pruners (dead qubit, XY weight) drop a word that can never
-//! reach the readout. As in the sum-of-terms engine, a word is checked just
+//! reach the readout.
+//!
+//! With k2, every box also carries the lowest order anything can reach it
+//! with (`low`). A word whose lowest order would be above k2 can only hold
+//! zeros, so its box is not made, or dropped, as the sum-of-terms engine drops
+//! a word once all its terms are cut. A rotation partner that would be born
+//! that way is not made at all; its word then keeps only its cos part (a
+//! single). As in the sum-of-terms engine, a word is checked just
 //! before a gate that changes it, against the gates from that one on.
 
 use super::{Angle, Block, BlockProg, Step, Tape, NONE};
@@ -42,13 +49,53 @@ struct Boxes<const NW: usize> {
     /// A box already in a pair of the current step is skipped, so a pair whose
     /// two words both exist is written once, not once from each side.
     stamp: Vec<u32>,
-    /// box -> false once its word has been dropped (k1).
+    /// box -> false once its word has been dropped (k1, pruners, k2).
     alive: Vec<bool>,
+    /// box -> the lowest order (number of factors) it holds, with k2; a new
+    /// box starts at `UNREACHED` (it holds nothing yet).
+    low: Vec<u32>,
+}
+
+/// The `low` of a box that holds nothing yet.
+const UNREACHED: u32 = u32::MAX;
+
+/// The k2 truncation, as the compiler sees it: how many orders each step moves
+/// a contribution up (see `orders.rs`).
+#[derive(Clone, Copy)]
+struct Orders {
+    k2: u32,
+    sine: bool,
+}
+
+impl Orders {
+    /// (cos part, sin part) of a rotation.
+    fn rotation(&self, angle: &Angle) -> (u32, u32) {
+        match angle {
+            Angle::Param(_) if self.sine => (0, 1),
+            Angle::Param(_) => (1, 1),
+            Angle::Fixed { .. } => (0, 0),
+        }
+    }
+
+    /// A block entry with `n_sin` sin and `n_cos` cos factors.
+    fn entry(&self, angle: &Angle, n_sin: u8, n_cos: u8) -> u32 {
+        match angle {
+            Angle::Param(_) if self.sine => n_sin as u32,
+            Angle::Param(_) => (n_sin + n_cos) as u32,
+            Angle::Fixed { .. } => 0,
+        }
+    }
 }
 
 impl<const NW: usize> Boxes<NW> {
     fn new() -> Self {
-        Boxes { words: Vec::new(), index: FxHashMap::default(), stamp: Vec::new(), alive: Vec::new() }
+        Boxes {
+            words: Vec::new(),
+            index: FxHashMap::default(),
+            stamp: Vec::new(),
+            alive: Vec::new(),
+            low: Vec::new(),
+        }
     }
 
     fn len(&self) -> usize {
@@ -66,6 +113,7 @@ impl<const NW: usize> Boxes<NW> {
         self.index.insert(word, b);
         self.stamp.push(0);
         self.alive.push(true);
+        self.low.push(UNREACHED);
         b
     }
 
@@ -169,6 +217,7 @@ pub(crate) fn compile<const NW: usize>(
     sine_order: bool,
 ) -> Result<Compiled<NW>, String> {
     let too_heavy = |w: &PauliKey<NW>| k1 >= 0 && combined_weight(&w.0, &w.1) > k1 as u32;
+    let orders = if k2 >= 0 { Some(Orders { k2: k2 as u32, sine: sine_order }) } else { None };
     // The gates in propagation order, and what the pruners need of them.
     let gate_masks: Vec<[u64; NW]> = gates.iter().rev().map(|g| g.wire_mask).collect();
     let active_from = dead_qubit_masks(&gate_masks);
@@ -184,6 +233,7 @@ pub(crate) fn compile<const NW: usize>(
         steps: Vec::new(),
         pairs: Vec::new(),
         negs: Vec::new(),
+        singles: Vec::new(),
         blocks: Vec::new(),
         block_progs: Vec::new(),
         readout: Vec::new(),
@@ -195,6 +245,7 @@ pub(crate) fn compile<const NW: usize>(
     // one box with the coefficients added.
     for &(word, coeff) in observable {
         let b = boxes.get_or_new(word);
+        boxes.low[b as usize] = 0; // a plain coefficient has no factors
         match tape.init.iter_mut().find(|(ib, _)| *ib == b) {
             Some((_, c)) => *c += coeff,
             None => tape.init.push((b, coeff)),
@@ -243,9 +294,9 @@ pub(crate) fn compile<const NW: usize>(
             }
         } else if is_controlled_rotation(gate.kind) {
             let groups = cr_groups.entry(gate.kind).or_insert_with(|| CrGroups::new(gate.kind, &mut tape));
-            controlled_rotation_step(gate, groups, &mut boxes, &mut tape, &too_heavy, &pruned_here);
+            controlled_rotation_step(gate, groups, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders);
         } else {
-            rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here)?;
+            rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders)?;
         }
 
         if !observable_cut && mask_intersects(&gate.wire_mask, &obs_support) {
@@ -273,6 +324,7 @@ fn rotation_step<const NW: usize>(
     tape: &mut Tape,
     too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
     pruned: &impl Fn(&PauliKey<NW>) -> bool,
+    orders: Option<Orders>,
 ) -> Result<(), String> {
     let rule = rotation_rule(gate.kind)
         .ok_or_else(|| format!("the tape cannot compile gate kind {} yet", gate.kind))?;
@@ -293,6 +345,7 @@ fn rotation_step<const NW: usize>(
     };
     let step = tape.steps.len() as u32 + 1;
     let first = tape.pairs.len() as u32;
+    let sfirst = tape.singles.len() as u32;
 
     // Only the words that exist before this gate can be changed by it; the
     // partners it creates are already in a pair of this step.
@@ -317,18 +370,51 @@ fn rotation_step<const NW: usize>(
         // whole future, including what it gives this word here, adds 0 to the
         // readout (they are exact), so keeping its box changes no value and
         // saves making a fresh one.
-        let partner = boxes.get_or_new(set_label(x, z, gate.wire0, out));
+        let partner_word = set_label(x, z, gate.wire0, out);
+        let existing = boxes.index.get(&partner_word).copied();
+        if let (Some(o), None) = (orders, existing) {
+            // A new partner would only get this word's sin part, at orders
+            // low + ss and up: if that is above k2 it is not made, and the word
+            // keeps its cos part (or is dropped too, if that is above k2 as well).
+            let (sc, ss) = o.rotation(&angle);
+            let lw = boxes.low[b];
+            if lw.saturating_add(ss) > o.k2 {
+                boxes.stamp[b] = step;
+                if lw.saturating_add(sc) > o.k2 {
+                    boxes.drop_box(b);
+                } else {
+                    boxes.low[b] = lw + sc;
+                    tape.singles.push(b as u32);
+                }
+                continue;
+            }
+        }
+        let partner = existing.unwrap_or_else(|| boxes.get_or_new(partner_word));
         // `word -> cos·word + sign·sin·partner`: with sign +1 the word is
         // `a`; with sign -1 the partner is (the rule is antisymmetric).
         let pair = if sign > 0 { [b as u32, partner] } else { [partner, b as u32] };
         boxes.stamp[pair[0] as usize] = step;
         boxes.stamp[pair[1] as usize] = step;
         tape.pairs.push(pair);
+        if let Some(o) = orders {
+            // new a = c·a + (−s)·b, new b = s·a + c·b: each part moves up by its factors.
+            let (sc, ss) = o.rotation(&angle);
+            let (a, bb) = (pair[0] as usize, pair[1] as usize);
+            let (la, lb) = (boxes.low[a], boxes.low[bb]);
+            boxes.low[a] = la.saturating_add(sc).min(lb.saturating_add(ss));
+            boxes.low[bb] = la.saturating_add(ss).min(lb.saturating_add(sc));
+            for m in [a, bb] {
+                if boxes.low[m] > o.k2 {
+                    boxes.drop_box(m); // it now holds only orders above k2, i.e. zeros
+                }
+            }
+        }
     }
 
     let last = tape.pairs.len() as u32;
-    if last > first {
-        tape.steps.push(Step::Rotate { angle, first, last });
+    let slast = tape.singles.len() as u32;
+    if last > first || slast > sfirst {
+        tape.steps.push(Step::Rotate { angle, first, last, sfirst, slast });
     }
     Ok(())
 }
@@ -412,6 +498,7 @@ fn controlled_rotation_step<const NW: usize>(
     tape: &mut Tape,
     too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
     pruned: &impl Fn(&PauliKey<NW>) -> bool,
+    orders: Option<Orders>,
 ) {
     let (control, target) = (gate.wire0, gate.wire1 as u32);
     let angle = if gate.param >= 0 {
@@ -438,20 +525,48 @@ fn controlled_rotation_step<const NW: usize>(
             continue;
         }
         let (codes, prog) = &groups.groups[g];
+        let words: Vec<PauliKey<NW>> = codes
+            .iter()
+            .map(|&c| {
+                let (mx, mz) = set_label(x, z, control, c >> 2);
+                set_label(mx, mz, target, c & 3)
+            })
+            .collect();
+        let existing: Vec<Option<u32>> = words.iter().map(|w| boxes.index.get(w).copied()).collect();
+        // With k2: the lowest order each member will hold after the gate, from
+        // the members that hold something now.
+        let mut new_low = [UNREACHED; 4];
+        if let Some(o) = orders {
+            for &(out, inp, _, ns, nc) in &tape.block_progs[*prog as usize].entries {
+                if let Some(e) = existing[inp as usize] {
+                    let l = boxes.low[e as usize].saturating_add(o.entry(&angle, ns, nc));
+                    new_low[out as usize] = new_low[out as usize].min(l);
+                }
+            }
+        }
+        let doomed = |m: usize| orders.is_some_and(|o| new_low[m] > o.k2);
         let mut members = [NONE; 4];
-        for (m, &c) in codes.iter().enumerate() {
-            let (mx, mz) = set_label(x, z, control, c >> 2);
-            let word = set_label(mx, mz, target, c & 3);
-            members[m] = match boxes.index.get(&word) {
-                Some(&existing) => existing,
-                None if too_heavy(&word) => NONE,
-                None => boxes.get_or_new(word),
+        for (m, word) in words.iter().enumerate() {
+            members[m] = match existing[m] {
+                Some(e) => e,
+                None if too_heavy(word) || doomed(m) => NONE,
+                None => boxes.get_or_new(*word),
             };
             if members[m] != NONE {
                 boxes.stamp[members[m] as usize] = step;
             }
         }
         tape.blocks.push(Block { prog: *prog, members });
+        if orders.is_some() {
+            for m in 0..codes.len() {
+                if members[m] != NONE {
+                    boxes.low[members[m] as usize] = new_low[m];
+                    if doomed(m) {
+                        boxes.drop_box(members[m] as usize);
+                    }
+                }
+            }
+        }
     }
 
     let last = tape.blocks.len() as u32;

@@ -66,8 +66,10 @@ pub(crate) enum Angle {
 
 /// One step of the tape.
 pub(crate) enum Step {
-    /// A rotation: its angle, and the pairs of boxes it mixes, `pairs[first..last]`.
-    Rotate { angle: Angle, first: u32, last: u32 },
+    /// A rotation: its angle, the pairs of boxes it mixes, `pairs[first..last]`,
+    /// and the boxes whose partner was never made (k2: it could only have held
+    /// orders above k2), `singles[sfirst..slast]`, which keep their cos part.
+    Rotate { angle: Angle, first: u32, last: u32, sfirst: u32, slast: u32 },
     /// The minus signs of a Clifford gate: negate the boxes `negs[first..last]`.
     Negate { first: u32, last: u32 },
     /// Groups of up to 4 boxes, `blocks[first..last]`, each mixed by its
@@ -104,6 +106,8 @@ pub(crate) struct Tape {
     pub(crate) pairs: Vec<[u32; 2]>,
     /// The boxes of all negate steps, one step after another.
     pub(crate) negs: Vec<u32>,
+    /// The single boxes of all rotation steps (only with k2), one step after another.
+    pub(crate) singles: Vec<u32>,
     /// The blocks of all block steps, one step after another (20 bytes each).
     pub(crate) blocks: Vec<Block>,
     /// The kinds of block the blocks refer to (a handful per gate kind).
@@ -147,8 +151,8 @@ impl TapeDebug {
             .steps
             .iter()
             .map(|s| match *s {
-                Step::Rotate { angle: Angle::Param(p), first, last } => ("rotate", p as i64, first, last),
-                Step::Rotate { angle: Angle::Fixed { .. }, first, last } => ("fixed", -1, first, last),
+                Step::Rotate { angle: Angle::Param(p), first, last, .. } => ("rotate", p as i64, first, last),
+                Step::Rotate { angle: Angle::Fixed { .. }, first, last, .. } => ("fixed", -1, first, last),
                 Step::Negate { first, last } => ("negate", -1, first, last),
                 Step::Block { angle: Angle::Param(p), first, last } => ("block", p as i64, first, last),
                 Step::Block { angle: Angle::Fixed { .. }, first, last } => ("block_fixed", -1, first, last),
@@ -171,6 +175,20 @@ impl TapeDebug {
         d.set_item("steps", steps)?;
         d.set_item("pairs", t.pairs.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>())?;
         d.set_item("negs", t.negs)?;
+        // (step index, box) for every single, since a step tuple has one range.
+        let singles: Vec<(usize, u32)> = t
+            .steps
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| match *s {
+                Step::Rotate { sfirst, slast, .. } => t.singles[sfirst as usize..slast as usize]
+                    .iter()
+                    .map(|&b| (i, b))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        d.set_item("singles", singles)?;
         d.set_item("blocks", blocks)?;
         d.set_item("block_progs", progs)?;
         d.set_item("readout", t.readout)?;

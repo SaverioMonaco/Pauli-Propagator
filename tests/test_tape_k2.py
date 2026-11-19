@@ -71,6 +71,53 @@ def test_k2_on_brickwork(mode):
         np.testing.assert_allclose(g, og, atol=1e-12)
 
 
+def brickwork(n, L):
+    gates = []
+    for layer in range(L):
+        for q in range(n):
+            gates += [("RX", q), ("RY", q)]
+        gates += [("CNOT", (q, q + 1)) for q in range(layer % 2, n - 1, 2)]
+    return gates
+
+
+def tape_sizes(gates, word, **kw):
+    prop_kw = {k: kw.pop(k) for k in ("k1", "k2", "k2_mode") if k in kw}
+
+    def ansatz(params):
+        apply(gates, params)
+        return [qml.expval(pauli_op(word))]
+    p = Propagator(ansatz, **prop_kw)
+    p.propagate(n_threads=1, **kw)
+    return p.programs[0]
+
+
+def test_k2_below_every_path_leaves_an_empty_tape():
+    # 16 qubits, 6 layers: every path to the readout has more than 6 factors,
+    # so with k2 <= 6 (frequency) the answer is 0, and the tape should be
+    # (almost) empty instead of holding the whole k1 = 6 propagation.
+    n, L = 16, 6
+    gates = brickwork(n, L)
+    word = "I" * (n // 2) + "Z" + "I" * (n - n // 2 - 1)
+    theta = np.random.default_rng(9).uniform(-np.pi, np.pi, 2 * n * L)
+    full = tape_sizes(gates, word, k1=6, use_dead_qubit_pruner=True, use_xy_weight_pruner=True)
+    for k2 in (2, 6):
+        small = tape_sizes(gates, word, k1=6, k2=k2, use_dead_qubit_pruner=True, use_xy_weight_pruner=True)
+        assert small.n_pairs < full.n_pairs / 20
+        assert small.eval(np.sin(theta), np.cos(theta)) == 0.0
+
+
+@pytest.mark.parametrize("mode", ["frequency", "sine"])
+def test_k2_tapes_are_smaller_and_large_k2_changes_nothing(mode):
+    n, L = 6, 4
+    gates = brickwork(n, L)
+    word = "I" * (n // 2) + "Z" + "I" * (n - n // 2 - 1)
+    full = tape_sizes(gates, word, k1=3)
+    sizes = [tape_sizes(gates, word, k1=3, k2=k2, k2_mode=mode).n_pairs for k2 in (1, 3, 6)]
+    assert sizes == sorted(sizes) and sizes[0] < full.n_pairs
+    # k2 above the most factors any path can have (one per trainable gate): same tape.
+    assert tape_sizes(gates, word, k1=3, k2=2 * n * L, k2_mode=mode).n_pairs == full.n_pairs
+
+
 def test_k2_zero_keeps_only_paths_without_factors():
     # RX(θ0): <Z> = cos θ0, which has one factor; k2 = 0 drops it entirely.
     gates = [("RX", 0)]

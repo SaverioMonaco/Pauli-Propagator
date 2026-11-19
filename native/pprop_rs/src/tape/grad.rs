@@ -69,10 +69,10 @@ impl Tape {
         }
 
         // Forward, saving the old value of every box a pair or block writes.
-        let mut saved: Vec<f64> = Vec::with_capacity(2 * self.pairs.len() + 4 * self.blocks.len());
+        let mut saved: Vec<f64> = Vec::with_capacity(2 * self.pairs.len() + self.singles.len() + 4 * self.blocks.len());
         for step in &self.steps {
             match *step {
-                Step::Rotate { ref angle, first, last } => {
+                Step::Rotate { ref angle, first, last, sfirst, slast } => {
                     let (c, s, _) = cos_sin(angle, sins, coss);
                     for &[a, b] in &self.pairs[first as usize..last as usize] {
                         let (a, b) = (a as usize, b as usize);
@@ -81,6 +81,10 @@ impl Tape {
                         saved.push(vb);
                         v[a] = c * va - s * vb;
                         v[b] = s * va + c * vb;
+                    }
+                    for &b in &self.singles[sfirst as usize..slast as usize] {
+                        saved.push(v[b as usize]);
+                        v[b as usize] *= c;
                     }
                 }
                 Step::Negate { first, last } => {
@@ -124,8 +128,17 @@ impl Tape {
         let mut top = saved.len();
         for step in self.steps.iter().rev() {
             match *step {
-                Step::Rotate { ref angle, first, last } => {
+                Step::Rotate { ref angle, first, last, sfirst, slast } => {
                     let (c, s, p) = cos_sin(angle, sins, coss);
+                    // A single: a' = c·a, so grad += λa'·(−s·a) and λa = c·λa'.
+                    for &b in self.singles[sfirst as usize..slast as usize].iter().rev() {
+                        top -= 1;
+                        let b = b as usize;
+                        if let Some(p) = p {
+                            grad[p] += lam[b] * (-s * saved[top]);
+                        }
+                        lam[b] *= c;
+                    }
                     for &[a, b] in self.pairs[first as usize..last as usize].iter().rev() {
                         let (a, b) = (a as usize, b as usize);
                         top -= 2;
@@ -219,15 +232,16 @@ mod tests {
             n_boxes: 5,
             init: vec![(0, 0.7), (1, -0.2), (4, 0.5)],
             steps: vec![
-                Step::Rotate { angle: Angle::Param(0), first: 0, last: 2 },
+                Step::Rotate { angle: Angle::Param(0), first: 0, last: 2, sfirst: 0, slast: 0 },
                 Step::Negate { first: 0, last: 1 },
-                Step::Rotate { angle: Angle::Fixed { cos: 0.6, sin: 0.8 }, first: 2, last: 3 },
+                Step::Rotate { angle: Angle::Fixed { cos: 0.6, sin: 0.8 }, first: 2, last: 3, sfirst: 0, slast: 1 },
                 Step::Block { angle: Angle::Param(1), first: 0, last: 1 },
                 Step::Block { angle: Angle::Param(2), first: 1, last: 2 },
-                Step::Rotate { angle: Angle::Param(0), first: 3, last: 4 },
+                Step::Rotate { angle: Angle::Param(0), first: 3, last: 4, sfirst: 1, slast: 2 },
             ],
             pairs: vec![[0, 2], [1, 3], [2, 4], [4, 0]],
             negs: vec![2],
+            singles: vec![1, 3],
             blocks: vec![Block { prog: 0, members: [0, 1, 2, 3] }, Block { prog: 1, members: [3, NONE, NONE, NONE] }],
             block_progs: vec![quad, pair],
             readout: vec![0, 3],

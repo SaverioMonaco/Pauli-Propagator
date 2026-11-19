@@ -21,7 +21,7 @@ def word_str(x, z, n):
     return "".join(LETTERS[((x[0] >> q) & 1, (z[0] >> q) & 1)] for q in range(n))
 
 
-def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False):
+def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False, k2=-1, sine=False):
     """gates: [(name, wires, param index)] in circuit order; wires is a qubit or
     a (control, target) pair; param is -1 for a Clifford gate.
     observable: [(word string, coefficient)].
@@ -41,6 +41,8 @@ def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False):
         k1,
         dead,
         xy,
+        k2,
+        sine,
     )
     d["words"] = [word_str(x, z, n) for x, z in d["words"]]
     return d
@@ -201,6 +203,22 @@ def test_debug_fields():
             "readout", "words", "alive", "k2", "sine_order"} <= set(d)
     assert d["k2"] == -1 and d["sine_order"] is False
     assert d["blocks"] == [] and d["block_progs"] == []
+
+
+def test_k2_drops_words_that_can_only_hold_zeros():
+    # RX(θ0), RX(θ1) on <Z>, k2 = 1 (frequency): after RX(θ1), Z and Y each have
+    # one factor (low 1); RX(θ0) adds one more to everything, so both words
+    # could only hold order 2 > k2: dropped, and the readout is empty.
+    t = compile_tape(1, [("RX", 0, 0), ("RX", 0, 1)], [("Z", 1.0)], k2=1)
+    assert t["words"] == ["Z", "Y"] and t["alive"] == [False, False] and t["readout"] == []
+
+
+def test_k2_singles_in_sine_mode():
+    # Sine mode, k2 = 0: Y would only get Z's sin part (one sin), so it is never
+    # made, and Z keeps its cos part at both gates: two steps with a single each.
+    t = compile_tape(1, [("RX", 0, 0), ("RX", 0, 1)], [("Z", 1.0)], k2=0, sine=True)
+    assert t["words"] == ["Z"] and t["n_boxes"] == 1 and t["pairs"] == []
+    assert t["singles"] == [(0, 0), (1, 0)] and t["readout"] == [0]
 
 
 def test_t_gate_is_a_fixed_rz_pair():

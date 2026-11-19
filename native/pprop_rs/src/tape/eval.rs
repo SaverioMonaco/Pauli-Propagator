@@ -21,7 +21,7 @@ impl Tape {
         }
         for step in &self.steps {
             match *step {
-                Step::Rotate { ref angle, first, last } => {
+                Step::Rotate { ref angle, first, last, sfirst, slast } => {
                     let (c, s) = match *angle {
                         Angle::Param(p) => (coss[p as usize], sins[p as usize]),
                         Angle::Fixed { cos, sin } => (cos, sin),
@@ -31,6 +31,9 @@ impl Tape {
                         let (va, vb) = (v[a], v[b]);
                         v[a] = c * va - s * vb;
                         v[b] = s * va + c * vb;
+                    }
+                    for &b in &self.singles[sfirst as usize..slast as usize] {
+                        v[b as usize] *= c;
                     }
                 }
                 Step::Negate { first, last } => {
@@ -103,7 +106,7 @@ mod tests {
 
     fn tape(n_boxes: u32, init: Vec<(u32, f64)>, steps: Vec<Step>, pairs: Vec<[u32; 2]>,
             blocks: Vec<Block>, block_progs: Vec<BlockProg>, readout: Vec<u32>) -> Tape {
-        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), blocks, block_progs, readout, k2: -1, sine_order: false }
+        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), singles: Vec::new(), blocks, block_progs, readout, k2: -1, sine_order: false }
     }
 
     /// A pair rotation written as a 2-member block: new a = c·a − s·b, new b = s·a + c·b.
@@ -115,7 +118,7 @@ mod tests {
     fn block_of_two_is_a_rotation() {
         let (s, c) = 0.7f64.sin_cos();
         let init = vec![(0, 0.3), (1, -1.1)];
-        let rotate = tape(2, init.clone(), vec![Step::Rotate { angle: Angle::Param(0), first: 0, last: 1 }],
+        let rotate = tape(2, init.clone(), vec![Step::Rotate { angle: Angle::Param(0), first: 0, last: 1, sfirst: 0, slast: 0 }],
                           vec![[0, 1]], vec![], vec![], vec![0, 1]);
         let block = tape(2, init, vec![Step::Block { angle: Angle::Param(0), first: 0, last: 1 }],
                          vec![], vec![Block { prog: 0, members: [0, 1, NONE, NONE] }], vec![pair_prog()], vec![0, 1]);
