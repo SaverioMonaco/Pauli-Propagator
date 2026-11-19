@@ -133,8 +133,10 @@ fn evolve_single_gate_debug(
     ))
 }
 
-/// Compile each observable into a `TapeProgram` (one-qubit rotations so far).
+/// Compile each observable into a `TapeProgram`, dropping words of Pauli
+/// weight above `k1` (-1: no limit).
 #[pyfunction]
+#[pyo3(signature = (num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts, k1 = -1))]
 #[allow(clippy::too_many_arguments)]
 fn compile_tapes(
     py: Python<'_>,
@@ -145,18 +147,20 @@ fn compile_tapes(
     gate_param: Vec<i64>,
     gate_fixed: Vec<Option<f64>>,
     paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
+    k1: i64,
 ) -> PyResult<Vec<TapeProgram>> {
     let nw = words_needed(num_qubits);
     py.allow_threads(move || {
         dispatch_nw!(
             nw, num_qubits, compile_tapes_impl,
-            (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts)
+            (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts, k1)
         )
     })
 }
 
 /// Test-only: the tape of one observable as plain lists (see `tape::tape_debug_impl`).
 #[pyfunction]
+#[pyo3(signature = (num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable, k1 = -1))]
 #[allow(clippy::too_many_arguments)]
 fn tape_debug(
     num_qubits: u32,
@@ -166,11 +170,12 @@ fn tape_debug(
     gate_param: Vec<i64>,
     gate_fixed: Vec<Option<f64>>,
     observable: Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>,
+    k1: i64,
 ) -> PyResult<tape::TapeDebug> {
     let nw = words_needed(num_qubits);
     dispatch_nw!(
         nw, num_qubits, tape_debug_impl,
-        (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable)
+        (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable, k1)
     )
 }
 

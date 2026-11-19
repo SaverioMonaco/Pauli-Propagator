@@ -2,7 +2,9 @@
 statevectors and against the sum-of-terms engine.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP).
+angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
+truncation (checked against the sum-of-terms engine: a statevector cannot
+truncate).
 """
 import itertools
 import random
@@ -41,7 +43,7 @@ def with_params(gates):
     return out, p
 
 
-def tapes(n, gates, observables):
+def tapes(n, gates, observables, k1=-1):
     gates, _ = with_params(gates)
     wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     return pprop_rs.compile_tapes(
@@ -52,6 +54,7 @@ def tapes(n, gates, observables):
         [p for _, _, p in gates],
         [None] * len(gates),
         [obs_spec(o) for o in observables],
+        k1,
     )
 
 
@@ -84,11 +87,15 @@ def statevector(n, gates, observable, theta):
     return float(sum(c * v for (_, c), v in zip(observable, np.atleast_1d(f()))))
 
 
-def old_engine(gates, word, theta):
+def old_engine(gates, observable, theta, k1=None):
+    """observable: a word string, or [(word string, coeff)]."""
+    if isinstance(observable, str):
+        observable = [(observable, 1.0)]
+
     def ansatz(params):
         apply(gates, params)
-        return [qml.expval(pauli_op(word))]
-    prop = Propagator(ansatz)
+        return [qml.expval(qml.dot([c for _, c in observable], [pauli_op(w) for w, _ in observable]))]
+    prop = Propagator(ansatz, k1=k1)
     prop.propagate(n_threads=1)
     return float(np.ravel(prop(theta))[0])
 
@@ -185,6 +192,49 @@ def test_brickwork():
     expected = statevector(n, gates, [(word, 1.0)], theta)
     assert tape_value(program, theta) == pytest.approx(expected, abs=1e-12)
     assert tape_value(program, theta) == pytest.approx(old_engine(gates, word, theta), abs=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_k1_matches_old_engine(seed):
+    n, gates, observable, theta = random_case(seed)
+    k1 = random.Random(seed).randint(1, n)
+    (program,) = tapes(n, gates, [observable], k1=k1)
+    assert tape_value(program, theta) == pytest.approx(old_engine(gates, observable, theta, k1=k1), abs=1e-12)
+
+
+@pytest.mark.parametrize("k1", [1, 2, 3, 4])
+def test_k1_brickwork_matches_old_engine(k1):
+    n, L = 8, 3
+    gates = []
+    for layer in range(L):
+        for q in range(n):
+            gates += [("RX", q), ("RY", q)]
+        gates += [("CNOT", (q, q + 1)) for q in range(layer % 2, n - 1, 2)]
+    word = "I" * (n // 2) + "Z" + "I" * (n - n // 2 - 1)
+    theta = np.random.default_rng(k1).uniform(-np.pi, np.pi, 2 * n * L)
+    (program,) = tapes(n, gates, [[(word, 1.0)]], k1=k1)
+    (full,) = tapes(n, gates, [[(word, 1.0)]])
+    if k1 <= 3:                       # in 3 layers no word gets heavier than 4
+        assert program.n_boxes < full.n_boxes
+    assert tape_value(program, theta) == pytest.approx(old_engine(gates, word, theta, k1=k1), abs=1e-12)
+
+
+def test_k1_heavy_observable_words_match_old_engine():
+    # The observable's own too-heavy words: kept through the first gate that
+    # touches them, cut right after. A first CNOT can make them light again.
+    # (Gates are in circuit order, so the first gate met is the last listed.)
+    cases = [
+        ([("RX", 1), ("RY", 0), ("CNOT", (0, 1))], [("ZZ", 1.0), ("XI", 0.5)]),
+        ([("RX", 0), ("CNOT", (0, 1)), ("RY", 1)], [("ZZ", 1.0), ("ZI", -0.3)]),
+        ([("RY", 2), ("CZ", (0, 1)), ("RX", 0)], [("XZI", 0.7), ("IIZ", 0.2)]),
+    ]
+    for gates, observable in cases:
+        n = len(observable[0][0])
+        _, n_params = with_params(gates)
+        theta = np.random.default_rng(3).uniform(-np.pi, np.pi, n_params)
+        (program,) = tapes(n, gates, [observable], k1=1)
+        assert tape_value(program, theta) == pytest.approx(
+            old_engine(gates, observable, theta, k1=1), abs=1e-12), (gates, observable)
 
 
 def test_several_observables_and_several_thetas():

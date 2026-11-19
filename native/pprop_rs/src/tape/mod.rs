@@ -83,7 +83,8 @@ pub(crate) struct Tape {
 /// What `tape_debug` returns to Python: `n_boxes`, `init`, the steps as
 /// `("rotate", parameter index, first pair, last pair)` or
 /// `("negate", -1, first, last)`, the pairs, the negated boxes, the readout,
-/// and the word of every box as `(x words, z words)`.
+/// the word of every box as `(x words, z words)`, and whether each box is
+/// still alive at the end (false once dropped by k1).
 pub(crate) type TapeDebug = (
     u32,
     Vec<(u32, f64)>,
@@ -92,6 +93,7 @@ pub(crate) type TapeDebug = (
     Vec<u32>,
     Vec<u32>,
     Vec<(Vec<u64>, Vec<u64>)>,
+    Vec<bool>,
 );
 
 /// Test-only: compile one observable and return the tape as plain lists, so
@@ -104,10 +106,11 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     gate_param: Vec<i64>,
     gate_fixed: Vec<Option<f64>>,
     observable: Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>,
+    k1: i64,
 ) -> PyResult<TapeDebug> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let obs = observable_from_spec::<NW>(observable)?;
-    let (tape, words) = compile(&gates, &obs).map_err(PyValueError::new_err)?;
+    let (tape, words, alive) = compile(&gates, &obs, k1).map_err(PyValueError::new_err)?;
     let steps = tape
         .steps
         .iter()
@@ -125,6 +128,7 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
         tape.negs,
         tape.readout,
         words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect(),
+        alive,
     ))
 }
 
@@ -208,12 +212,13 @@ pub(crate) fn compile_tapes_impl<const NW: usize>(
     gate_param: Vec<i64>,
     gate_fixed: Vec<Option<f64>>,
     paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
+    k1: i64,
 ) -> PyResult<Vec<TapeProgram>> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let mut programs = Vec::with_capacity(paulidicts.len());
     for spec in paulidicts {
         let obs = observable_from_spec::<NW>(spec)?;
-        let (tape, _words) = compile(&gates, &obs).map_err(PyValueError::new_err)?;
+        let (tape, _words, _alive) = compile(&gates, &obs, k1).map_err(PyValueError::new_err)?;
         let n_params = tape.n_params();
         programs.push(TapeProgram { tape, n_params });
     }

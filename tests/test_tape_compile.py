@@ -1,7 +1,8 @@
 """The tape compiler (pprop_rs.tape_debug), checked before tapes can be evaluated.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP).
+angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
+truncation.
 """
 import random
 
@@ -20,7 +21,7 @@ def word_str(x, z, n):
     return "".join(LETTERS[((x[0] >> q) & 1, (z[0] >> q) & 1)] for q in range(n))
 
 
-def compile_tape(n, gates, observable):
+def compile_tape(n, gates, observable, k1=-1):
     """gates: [(name, wires, param index)] in circuit order; wires is a qubit or
     a (control, target) pair; param is -1 for a Clifford gate.
     observable: [(word string, coefficient)].
@@ -29,7 +30,7 @@ def compile_tape(n, gates, observable):
         return [sum(1 << q for q, ch in enumerate(word) if ch in letters)]
     wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     obs = [(bits(w, "XY"), bits(w, "ZY"), c, [], []) for w, c in observable]
-    n_boxes, init, steps, pairs, negs, readout, words = pprop_rs.tape_debug(
+    n_boxes, init, steps, pairs, negs, readout, words, alive = pprop_rs.tape_debug(
         n,
         [_GATE_KIND[g] for g, _, _ in gates],
         [w0 for w0, _ in wires],
@@ -37,9 +38,10 @@ def compile_tape(n, gates, observable):
         [p for _, _, p in gates],
         [None] * len(gates),
         obs,
+        k1,
     )
     return dict(n_boxes=n_boxes, init=init, steps=steps, pairs=pairs, negs=negs, readout=readout,
-                words=[word_str(x, z, n) for x, z in words])
+                words=[word_str(x, z, n) for x, z in words], alive=alive)
 
 
 def test_example_by_hand():
@@ -131,6 +133,33 @@ def test_swap_exchanges_names_in_one_go():
     assert t["words"] == ["ZX", "XZ"]
     assert t["init"] == [(0, 1.0), (1, 2.0)]
     assert t["steps"] == []
+
+
+def test_k1_drops_a_word_a_cnot_makes_too_heavy():
+    # RX(θ0) q1, CNOT(0 -> 1), RX(θ1) q0, <Z0>, k1 = 1. Backwards: RX(θ1)
+    # pairs ZI with YI; the CNOT leaves ZI alone but turns YI into YX
+    # (weight 2 > k1), so YI's box is dropped; RX(θ0) then touches nothing.
+    gates = [("RX", 1, 0), ("CNOT", (0, 1), -1), ("RX", 0, 1)]
+    t = compile_tape(2, gates, [("ZI", 1.0)], k1=1)
+    assert t["words"] == ["ZI", "YI"] and t["alive"] == [True, False]
+    assert t["steps"] == [("rotate", 1, 0, 1)]
+    assert t["readout"] == [0]
+    # Without k1 the word lives on as YX (RX(θ0) on q1 leaves its X alone).
+    t = compile_tape(2, gates, [("ZI", 1.0)])
+    assert t["words"] == ["ZI", "YX"] and all(t["alive"])
+
+
+def test_observable_cut_after_its_first_gate():
+    # ZZ is too heavy for k1 = 1, but the first gate touching it is a CNOT
+    # that turns it into IZ: it is kept, as in the sum-of-terms engine.
+    t = compile_tape(2, [("CNOT", (0, 1), -1)], [("ZZ", 1.0)], k1=1)
+    assert t["words"] == ["IZ"] and t["alive"] == [True] and t["readout"] == [0]
+    # A rotation keeps its weight: ZZ is dropped right after it.
+    t = compile_tape(2, [("RX", 0, 0)], [("ZZ", 1.0)], k1=1)
+    assert t["alive"] == [False] and t["readout"] == [] and t["steps"] == []
+    # No gate touches the observable: nothing is cut.
+    t = compile_tape(3, [("RX", 2, 0)], [("ZZI", 1.0)], k1=1)
+    assert t["alive"] == [True] and t["readout"] == [0]
 
 
 def test_gates_not_supported_yet():
