@@ -28,6 +28,7 @@ mod tape;
 mod terms;
 mod threads;
 use pauli::*;
+use tape::tape_debug_impl;
 use terms::*;
 
 /// Dispatches to the `$f::<NW>` monomorphization matching `$nw` (a
@@ -131,11 +132,31 @@ fn evolve_single_gate_debug(
     ))
 }
 
+/// Test-only: the tape of one observable as plain lists (see `tape::tape_debug_impl`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn tape_debug(
+    num_qubits: u32,
+    gate_kind: Vec<u8>,
+    gate_wire0: Vec<u32>,
+    gate_wire1: Vec<i64>,
+    gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
+    observable: Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>,
+) -> PyResult<tape::TapeDebug> {
+    let nw = words_needed(num_qubits);
+    dispatch_nw!(
+        nw, num_qubits, tape_debug_impl,
+        (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable)
+    )
+}
+
 #[pymodule]
 fn pprop_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(propagate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(ragged_layout, m)?)?;
     m.add_class::<Evaluator>()?;
     m.add_function(wrap_pyfunction!(evolve_single_gate_debug, m)?)?;
+    m.add_function(wrap_pyfunction!(tape_debug, m)?)?;
     Ok(())
 }

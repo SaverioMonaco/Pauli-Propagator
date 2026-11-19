@@ -34,6 +34,15 @@
 // Nothing uses the tape until it can be evaluated (A3).
 #![allow(dead_code)]
 
+mod compile;
+
+pub(crate) use compile::*;
+
+use crate::gates::GateSpec;
+use crate::pauli::*;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
 /// The angle of one rotation step.
 pub(crate) enum Angle {
     /// A trainable parameter: its index in the parameter vector.
@@ -62,4 +71,58 @@ pub(crate) struct Tape {
     pub(crate) pairs: Vec<[u32; 2]>,
     /// The boxes added up at the end: the words with only I and Z.
     pub(crate) readout: Vec<u32>,
+}
+
+/// What `tape_debug` returns to Python: `n_boxes`, `init`, the steps as
+/// `(parameter index, first pair, last pair)`, the pairs, the readout, and
+/// the word of every box as `(x words, z words)`.
+pub(crate) type TapeDebug = (
+    u32,
+    Vec<(u32, f64)>,
+    Vec<(u32, u32, u32)>,
+    Vec<(u32, u32)>,
+    Vec<u32>,
+    Vec<(Vec<u64>, Vec<u64>)>,
+);
+
+/// Test-only: compile one observable and return the tape as plain lists, so
+/// tests can check the compiler before the tape can be evaluated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tape_debug_impl<const NW: usize>(
+    gate_kind: Vec<u8>,
+    gate_wire0: Vec<u32>,
+    gate_wire1: Vec<i64>,
+    gate_param: Vec<i64>,
+    gate_fixed: Vec<Option<f64>>,
+    observable: Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>,
+) -> PyResult<TapeDebug> {
+    let gates: Vec<GateSpec<NW>> = (0..gate_kind.len())
+        .map(|i| GateSpec::new(gate_kind[i], gate_wire0[i], gate_wire1[i], gate_param[i], gate_fixed[i]))
+        .collect();
+    let mut obs = Vec::with_capacity(observable.len());
+    for (xw, zw, coeff, sin_idx, cos_idx) in observable {
+        if !sin_idx.is_empty() || !cos_idx.is_empty() {
+            return Err(PyValueError::new_err(
+                "the tape needs an observable with plain coefficients (no sin/cos factors)",
+            ));
+        }
+        obs.push(((words_to_array::<NW>(&xw), words_to_array::<NW>(&zw)), coeff));
+    }
+    let (tape, words) = compile(&gates, &obs).map_err(PyValueError::new_err)?;
+    let steps = tape
+        .steps
+        .iter()
+        .map(|s| match s.angle {
+            Angle::Param(p) => (p, s.first, s.last),
+            Angle::Fixed { .. } => unreachable!("A2 compiles trainable rotations only"),
+        })
+        .collect();
+    Ok((
+        tape.n_boxes,
+        tape.init,
+        steps,
+        tape.pairs.iter().map(|p| (p[0], p[1])).collect(),
+        tape.readout,
+        words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect(),
+    ))
 }

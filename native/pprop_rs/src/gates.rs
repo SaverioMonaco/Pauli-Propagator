@@ -31,6 +31,19 @@ pub(crate) struct GateSpec<const NW: usize> {
     pub(crate) wire_mask: [u64; NW],
 }
 
+impl<const NW: usize> GateSpec<NW> {
+    /// One gate from the arrays Python passes (`wire1 = -1` for a one-qubit
+    /// gate, `param = -1` unless trainable, `fixed` for a constant angle).
+    pub(crate) fn new(kind: u8, wire0: u32, wire1: i64, param: i64, fixed: Option<f64>) -> Self {
+        let mut wire_mask = [0u64; NW];
+        set_wire_bit(&mut wire_mask, wire0);
+        if wire1 >= 0 {
+            set_wire_bit(&mut wire_mask, wire1 as u32);
+        }
+        GateSpec { kind, wire0, wire1, param, fixed, wire_mask }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Fixed-angle folding
 // ---------------------------------------------------------------------
