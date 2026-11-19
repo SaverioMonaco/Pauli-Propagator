@@ -2,7 +2,7 @@
 //! sin/cos factors, kept in per-thread arenas of nodes.
 
 use crate::threads::run_all;
-use crate::WordMap;
+use super::WordMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // A term during propagation: a coefficient times the monomial `mono` in a
