@@ -119,6 +119,10 @@ pub(crate) struct Tape {
     pub(crate) k2: i64,
     /// Whether k2 counts only sin factors (sine mode) or sin and cos factors.
     pub(crate) sine_order: bool,
+    /// With coeff_threshold: how many words were dropped as too small, and the
+    /// sum of their bounds (without k1 and k2, the error is at most this).
+    pub(crate) n_dropped: u32,
+    pub(crate) dropped_bound: f64,
 }
 
 impl Tape {
@@ -135,6 +139,7 @@ pub(crate) struct TapeDebug {
     tape: Tape,
     words: Vec<(Vec<u64>, Vec<u64>)>,
     alive: Vec<bool>,
+    bounds: Vec<f64>,
 }
 
 impl TapeDebug {
@@ -193,9 +198,12 @@ impl TapeDebug {
         d.set_item("block_progs", progs)?;
         d.set_item("readout", t.readout)?;
         d.set_item("k2", t.k2)?;
+        d.set_item("n_dropped", t.n_dropped)?;
+        d.set_item("dropped_bound", t.dropped_bound)?;
         d.set_item("sine_order", t.sine_order)?;
         d.set_item("words", self.words)?;
         d.set_item("alive", self.alive)?;
+        d.set_item("bounds", self.bounds)?;
         Ok(d.into_any().unbind())
     }
 }
@@ -215,13 +223,14 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     use_xy_weight_pruner: bool,
     k2: i64,
     sine_order: bool,
+    coeff_threshold: f64,
 ) -> PyResult<TapeDebug> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let obs = observable_from_spec::<NW>(observable)?;
-    let (tape, words, alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
+    let (tape, words, alive, bounds) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
         .map_err(PyValueError::new_err)?;
     let words = words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect();
-    Ok(TapeDebug { tape, words, alive })
+    Ok(TapeDebug { tape, words, alive, bounds })
 }
 
 /// The gates from the arrays Python passes, in circuit order.
@@ -321,6 +330,19 @@ impl TapeProgram {
         self.tape.k2
     }
 
+    /// With coeff_threshold: how many words were dropped as too small.
+    #[getter]
+    fn n_dropped(&self) -> u32 {
+        self.tape.n_dropped
+    }
+
+    /// With coeff_threshold: the sum of the dropped words' bounds. Without k1
+    /// and k2, the expectation value is off by at most this, for any parameters.
+    #[getter]
+    fn dropped_bound(&self) -> f64 {
+        self.tape.dropped_bound
+    }
+
     /// Number of pairs, over all steps (one 2x2 update each per evaluation).
     #[getter]
     fn n_pairs(&self) -> usize {
@@ -341,12 +363,13 @@ pub(crate) fn compile_tapes_impl<const NW: usize>(
     use_xy_weight_pruner: bool,
     k2: i64,
     sine_order: bool,
+    coeff_threshold: f64,
 ) -> PyResult<Vec<TapeProgram>> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let mut programs = Vec::with_capacity(paulidicts.len());
     for spec in paulidicts {
         let obs = observable_from_spec::<NW>(spec)?;
-        let (tape, _words, _alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
+        let (tape, ..) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
             .map_err(PyValueError::new_err)?;
         let n_params = tape.n_params();
         programs.push(TapeProgram { tape, n_params });

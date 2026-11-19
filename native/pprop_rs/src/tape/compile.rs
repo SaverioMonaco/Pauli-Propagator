@@ -30,7 +30,16 @@
 //! zeros, so its box is not made, or dropped, as the sum-of-terms engine drops
 //! a word once all its terms are cut. A rotation partner that would be born
 //! that way is not made at all; its word then keeps only its cos part (a
-//! single). As in the sum-of-terms engine, a word is checked just
+//! single).
+//!
+//! With `coeff_threshold`, every box also carries an upper bound on its
+//! coefficient over all parameters (`bound`): `|coeff|` for the observable;
+//! `√(Ba² + Bb²)` for both words of a trainable rotation pair (|c|, |s| with
+//! c² + s² = 1); `|c|·Ba + |s|·Bb` with a fixed angle; `Σ |coeff|·max|sⁿcᵐ|·B`
+//! for a block member. Without k2, the observable's norm caps every bound (the
+//! propagation is orthogonal and truncations only remove). A word whose bound
+//! is below the threshold is dropped, or not made, and its bound is added to
+//! `dropped_bound`: without k1 and k2, the result is off by at most that. As in the sum-of-terms engine, a word is checked just
 //! before a gate that changes it, against the gates from that one on.
 
 use super::{Angle, Block, BlockProg, Step, Tape, NONE};
@@ -54,10 +63,39 @@ struct Boxes<const NW: usize> {
     /// box -> the lowest order (number of factors) it holds, with k2; a new
     /// box starts at `UNREACHED` (it holds nothing yet).
     low: Vec<u32>,
+    /// box -> an upper bound on its coefficient over all parameters, with
+    /// coeff_threshold; a new box starts at 0.
+    bound: Vec<f64>,
 }
 
 /// The `low` of a box that holds nothing yet.
 const UNREACHED: u32 = u32::MAX;
+
+/// The coefficient threshold, as the compiler sees it.
+#[derive(Clone, Copy)]
+struct Threshold {
+    /// Drop a word whose bound is below this.
+    value: f64,
+    /// No coefficient can exceed this (the observable's norm, without k2).
+    cap: f64,
+}
+
+/// The largest `|sin^n cos^m|` over all angles: at sin² = n / (n + m).
+fn max_sin_cos(n: u8, m: u8) -> f64 {
+    if n == 0 || m == 0 {
+        return 1.0;
+    }
+    let (n, m) = (n as f64, m as f64);
+    ((n / (n + m)).powf(n) * (m / (n + m)).powf(m)).sqrt()
+}
+
+/// How large one block entry's factor `coeff · sⁿ · cᵐ` can be.
+fn entry_size(angle: &Angle, coeff: f64, n: u8, m: u8) -> f64 {
+    match *angle {
+        Angle::Param(_) => coeff.abs() * max_sin_cos(n, m),
+        Angle::Fixed { cos, sin } => (coeff * sin.powi(n as i32) * cos.powi(m as i32)).abs(),
+    }
+}
 
 /// The k2 truncation, as the compiler sees it: how many orders each step moves
 /// a contribution up (see `orders.rs`).
@@ -95,6 +133,7 @@ impl<const NW: usize> Boxes<NW> {
             stamp: Vec::new(),
             alive: Vec::new(),
             low: Vec::new(),
+            bound: Vec::new(),
         }
     }
 
@@ -114,7 +153,19 @@ impl<const NW: usize> Boxes<NW> {
         self.stamp.push(0);
         self.alive.push(true);
         self.low.push(UNREACHED);
+        self.bound.push(0.0);
         b
+    }
+
+    /// With a threshold, drop box `b` if its bound is below it, and count it.
+    fn cut(&mut self, b: usize, threshold: Option<Threshold>, tape: &mut Tape) {
+        if let Some(t) = threshold {
+            if self.alive[b] && self.bound[b] < t.value {
+                tape.n_dropped += 1;
+                tape.dropped_bound += self.bound[b];
+                self.drop_box(b);
+            }
+        }
     }
 
     /// Drop box `b`: its word leaves the table, so if the word comes back
@@ -199,9 +250,10 @@ fn rotation_rule(kind: u8) -> Option<fn(u8) -> Option<(u8, i8)>> {
     }
 }
 
-/// What `compile` returns: the tape, and for debugging the word of every box
-/// and whether it is still alive at the end.
-pub(crate) type Compiled<const NW: usize> = (Tape, Vec<PauliKey<NW>>, Vec<bool>);
+/// What `compile` returns: the tape, and for debugging the word of every box,
+/// whether it is still alive at the end, and its final coefficient bound
+/// (with coeff_threshold; 0 otherwise).
+pub(crate) type Compiled<const NW: usize> = (Tape, Vec<PauliKey<NW>>, Vec<bool>, Vec<f64>);
 
 /// Compile one observable through `gates` (in circuit order), dropping every
 /// word of weight above `k1` (`k1 < 0`: no limit) and, if asked, the words
@@ -215,6 +267,7 @@ pub(crate) fn compile<const NW: usize>(
     use_xy_weight_pruner: bool,
     k2: i64,
     sine_order: bool,
+    coeff_threshold: f64,
 ) -> Result<Compiled<NW>, String> {
     let too_heavy = |w: &PauliKey<NW>| k1 >= 0 && combined_weight(&w.0, &w.1) > k1 as u32;
     let orders = if k2 >= 0 { Some(Orders { k2: k2 as u32, sine: sine_order }) } else { None };
@@ -239,6 +292,8 @@ pub(crate) fn compile<const NW: usize>(
         readout: Vec::new(),
         k2,
         sine_order,
+        n_dropped: 0,
+        dropped_bound: 0.0,
     };
 
     // The observable's words are the first boxes. A word listed twice gets
@@ -249,6 +304,17 @@ pub(crate) fn compile<const NW: usize>(
         match tape.init.iter_mut().find(|(ib, _)| *ib == b) {
             Some((_, c)) => *c += coeff,
             None => tape.init.push((b, coeff)),
+        }
+    }
+    let threshold = (coeff_threshold >= 0.0).then(|| {
+        let norm = tape.init.iter().map(|(_, c)| c * c).sum::<f64>().sqrt();
+        Threshold { value: coeff_threshold, cap: if k2 >= 0 { f64::INFINITY } else { norm } }
+    });
+    if threshold.is_some() {
+        for i in 0..tape.init.len() {
+            let (b, c) = tape.init[i];
+            boxes.bound[b as usize] = c.abs();
+            boxes.cut(b as usize, threshold, &mut tape);
         }
     }
     // The observable's own words are cut to k1 right after the first gate that
@@ -294,9 +360,9 @@ pub(crate) fn compile<const NW: usize>(
             }
         } else if is_controlled_rotation(gate.kind) {
             let groups = cr_groups.entry(gate.kind).or_insert_with(|| CrGroups::new(gate.kind, &mut tape));
-            controlled_rotation_step(gate, groups, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders);
+            controlled_rotation_step(gate, groups, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders, threshold);
         } else {
-            rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders)?;
+            rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here, orders, threshold)?;
         }
 
         if !observable_cut && mask_intersects(&gate.wire_mask, &obs_support) {
@@ -313,7 +379,7 @@ pub(crate) fn compile<const NW: usize>(
     tape.readout = (0..boxes.len() as u32)
         .filter(|&b| boxes.alive[b as usize] && mask_is_zero(&boxes.words[b as usize].0))
         .collect();
-    Ok((tape, boxes.words, boxes.alive))
+    Ok((tape, boxes.words, boxes.alive, boxes.bound))
 }
 
 /// One rotation gate: pair every word it changes with the word it turns into.
@@ -325,6 +391,7 @@ fn rotation_step<const NW: usize>(
     too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
     pruned: &impl Fn(&PauliKey<NW>) -> bool,
     orders: Option<Orders>,
+    threshold: Option<Threshold>,
 ) -> Result<(), String> {
     let rule = rotation_rule(gate.kind)
         .ok_or_else(|| format!("the tape cannot compile gate kind {} yet", gate.kind))?;
@@ -372,20 +439,41 @@ fn rotation_step<const NW: usize>(
         // saves making a fresh one.
         let partner_word = set_label(x, z, gate.wire0, out);
         let existing = boxes.index.get(&partner_word).copied();
-        if let (Some(o), None) = (orders, existing) {
-            // A new partner would only get this word's sin part, at orders
-            // low + ss and up: if that is above k2 it is not made, and the word
-            // keeps its cos part (or is dropped too, if that is above k2 as well).
-            let (sc, ss) = o.rotation(&angle);
+        if existing.is_none() {
+            // A new partner would only get this word's sin part: at orders
+            // low + ss and up (k2), and at most |sin|·bound in size (threshold).
+            // If that is above k2 or below the threshold it is not made, and the
+            // word keeps its cos part, as a single.
             let lw = boxes.low[b];
-            if lw.saturating_add(ss) > o.k2 {
-                boxes.stamp[b] = step;
-                if lw.saturating_add(sc) > o.k2 {
-                    boxes.drop_box(b);
-                } else {
-                    boxes.low[b] = lw + sc;
-                    tape.singles.push(b as u32);
+            let k2_doomed = orders.is_some_and(|o| lw.saturating_add(o.rotation(&angle).1) > o.k2);
+            let (cos_size, sin_size) = match angle {
+                Angle::Param(_) => (1.0, 1.0),
+                Angle::Fixed { cos, sin } => (cos.abs(), sin.abs()),
+            };
+            let partner_bound = sin_size * boxes.bound[b];
+            let small = threshold.is_some_and(|t| partner_bound < t.value);
+            if k2_doomed || small {
+                if small && !k2_doomed {
+                    tape.n_dropped += 1; // the partner's part is lost
+                    tape.dropped_bound += partner_bound;
                 }
+                boxes.stamp[b] = step;
+                if let Some(o) = orders {
+                    let l = lw.saturating_add(o.rotation(&angle).0);
+                    if l > o.k2 {
+                        boxes.drop_box(b);
+                        continue;
+                    }
+                    boxes.low[b] = l;
+                }
+                if threshold.is_some() {
+                    boxes.bound[b] *= cos_size;
+                    boxes.cut(b, threshold, tape);
+                    if !boxes.alive[b] {
+                        continue;
+                    }
+                }
+                tape.singles.push(b as u32);
                 continue;
             }
         }
@@ -408,6 +496,23 @@ fn rotation_step<const NW: usize>(
                     boxes.drop_box(m); // it now holds only orders above k2, i.e. zeros
                 }
             }
+        }
+        if let Some(t) = threshold {
+            let (a, bb) = (pair[0] as usize, pair[1] as usize);
+            let (ba, bb_) = (boxes.bound[a], boxes.bound[bb]);
+            let (na, nb) = match angle {
+                Angle::Param(_) => {
+                    let r = (ba * ba + bb_ * bb_).sqrt();
+                    (r, r)
+                }
+                Angle::Fixed { cos, sin } => {
+                    (cos.abs() * ba + sin.abs() * bb_, sin.abs() * ba + cos.abs() * bb_)
+                }
+            };
+            boxes.bound[a] = na.min(t.cap);
+            boxes.bound[bb] = nb.min(t.cap);
+            boxes.cut(a, threshold, tape);
+            boxes.cut(bb, threshold, tape);
         }
     }
 
@@ -499,6 +604,7 @@ fn controlled_rotation_step<const NW: usize>(
     too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
     pruned: &impl Fn(&PauliKey<NW>) -> bool,
     orders: Option<Orders>,
+    threshold: Option<Threshold>,
 ) {
     let (control, target) = (gate.wire0, gate.wire1 as u32);
     let angle = if gate.param >= 0 {
@@ -545,11 +651,27 @@ fn controlled_rotation_step<const NW: usize>(
             }
         }
         let doomed = |m: usize| orders.is_some_and(|o| new_low[m] > o.k2);
+        // With a threshold: how large each member can be after the gate.
+        let mut new_bound = [0.0f64; 4];
+        if let Some(t) = threshold {
+            for &(out, inp, k, ns, nc) in &tape.block_progs[*prog as usize].entries {
+                if let Some(e) = existing[inp as usize] {
+                    new_bound[out as usize] += entry_size(&angle, k, ns, nc) * boxes.bound[e as usize];
+                }
+            }
+            new_bound.iter_mut().for_each(|b| *b = b.min(t.cap));
+        }
+        let small = |m: usize| threshold.is_some_and(|t| new_bound[m] < t.value);
         let mut members = [NONE; 4];
         for (m, word) in words.iter().enumerate() {
             members[m] = match existing[m] {
                 Some(e) => e,
                 None if too_heavy(word) || doomed(m) => NONE,
+                None if small(m) => {
+                    tape.n_dropped += 1; // what this member would have held is lost
+                    tape.dropped_bound += new_bound[m];
+                    NONE
+                }
                 None => boxes.get_or_new(*word),
             };
             if members[m] != NONE {
@@ -564,6 +686,14 @@ fn controlled_rotation_step<const NW: usize>(
                     if doomed(m) {
                         boxes.drop_box(members[m] as usize);
                     }
+                }
+            }
+        }
+        if threshold.is_some() {
+            for m in 0..codes.len() {
+                if members[m] != NONE {
+                    boxes.bound[members[m] as usize] = new_bound[m];
+                    boxes.cut(members[m] as usize, threshold, tape);
                 }
             }
         }

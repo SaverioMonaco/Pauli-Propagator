@@ -247,6 +247,8 @@ mod tests {
             readout: vec![0, 3],
             k2: -1,
             sine_order: false,
+            n_dropped: 0,
+            dropped_bound: 0.0,
         };
         let theta: [f64; 3] = [0.4, -1.3, 2.2];
         let s: Vec<f64> = theta.iter().map(|x| x.sin()).collect();

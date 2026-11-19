@@ -165,9 +165,8 @@ class Propagator:
         Populated by :meth:`propagate` when it uses the tape engine: one
         compiled tape per observable.
     engine : str or None
-        Populated by :meth:`propagate`: ``"tape"`` (the default), or
-        ``"terms"`` (the sum-of-terms engine) when ``coeff_threshold`` is
-        used, which the tape does not support yet.
+        Populated by :meth:`propagate`: ``"tape"``. (The sum-of-terms engine
+        only computes :attr:`exprs`.)
     _eval_list : list[Callable]
         Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> float`` for each observable, where ``sins`` and
@@ -299,12 +298,9 @@ class Propagator:
 
         ``k1`` and ``k2`` (with either ``k2_mode``) truncate exactly as in the
         sum-of-terms engine; with ``k2`` every box holds ``k2 + 1`` numbers,
-        one per number of sin/cos factors. With ``coeff_threshold``, which the
-        tape does not support yet, the sum-of-terms engine is used instead:
-        it builds :attr:`exprs` and compiles it into numeric evaluators (see
-        ``evaluator.make_sparse_evaluator``). :attr:`engine` says which was
-        used. In both cases :attr:`exprs` is available afterwards; with the
-        tape it is computed when first read.
+        one per number of sin/cos factors. ``coeff_threshold`` works
+        differently from the sum-of-terms engine, see below. :attr:`exprs` is
+        computed by the sum-of-terms engine when first read.
 
         Idempotent: calling this again after a successful call is a no-op
         (prints a notice and returns).
@@ -343,10 +339,17 @@ class Propagator:
             exceeds the maximum reduction achievable by the remaining
             circuit. Defaults to ``False``.
         coeff_threshold : float, optional
-            If given, any :data:`~pprop.pauli.sentence.CoeffTerm` whose
-            scalar magnitude falls below this threshold is discarded after
-            every gate step. This is approximate, equivalent to the old
-            ``CoefficientTruncation``. ``None`` (default) disables this.
+            If given, a Pauli word whose coefficient can never reach this
+            threshold, for any parameters, is dropped. The compiler keeps an
+            upper bound on every word's coefficient (over all parameters) and
+            drops the word once the bound falls below the threshold; the sum
+            of the dropped words' bounds is ``programs[i].dropped_bound``, and
+            without ``k1`` and ``k2`` the expectation value is off by at most
+            that, for any parameters. This differs from the sum-of-terms
+            engine, which drops each term whose numeric coefficient is below
+            the threshold: with ``coeff_threshold``, :attr:`exprs` (computed
+            that way) and :meth:`__call__` give different values. ``None``
+            (default) disables this.
         eval_n_jobs : int, optional
             Number of threads used to evaluate observables in parallel on
             every call to :meth:`__call__`/:meth:`eval_and_grad`. Defaults
@@ -388,31 +391,23 @@ class Propagator:
         self._eval_list = []
         self._eval_and_grad_list = []
 
-        if coeff_threshold is not None:
-            # No tape version of this truncation yet: the sum-of-terms engine.
-            self.engine = "terms"
-            self.programs = None
-            for expr in self.exprs:
-                fg = make_sparse_evaluator(expr, self.num_params)
-                self._eval_list.append(fg[0])
-                self._eval_and_grad_list.append(fg[1])
-        else:
-            self.engine = "tape"
-            gate_arrays, rust_paulidicts = self._rust_inputs
-            self.programs = pprop_rs.compile_tapes(
-                self.num_qubits,
-                *gate_arrays,
-                rust_paulidicts,
-                self.k1 if self.k1 is not None else -1,
-                use_dead_qubit_pruner,
-                use_xy_weight_pruner,
-                self.k2 if self.k2 is not None else -1,
-                self.k2_mode == "sine",
-            )
-            for program in self.programs:
-                fg = _tape_evaluator(program, self.num_params)
-                self._eval_list.append(fg[0])
-                self._eval_and_grad_list.append(fg[1])
+        self.engine = "tape"
+        gate_arrays, rust_paulidicts = self._rust_inputs
+        self.programs = pprop_rs.compile_tapes(
+            self.num_qubits,
+            *gate_arrays,
+            rust_paulidicts,
+            self.k1 if self.k1 is not None else -1,
+            use_dead_qubit_pruner,
+            use_xy_weight_pruner,
+            self.k2 if self.k2 is not None else -1,
+            self.k2_mode == "sine",
+            coeff_threshold if coeff_threshold is not None else -1.0,
+        )
+        for program in self.programs:
+            fg = _tape_evaluator(program, self.num_params)
+            self._eval_list.append(fg[0])
+            self._eval_and_grad_list.append(fg[1])
 
         if eval_n_jobs > 1:
             self._executor = ThreadPoolExecutor(max_workers=eval_n_jobs)

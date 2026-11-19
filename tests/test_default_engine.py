@@ -1,5 +1,5 @@
-"""Propagator's default engine is the tape; the sum-of-terms engine is kept
-for exprs/expression() and for coeff_threshold."""
+"""Propagator always uses the tape; the sum-of-terms engine is kept for
+exprs/expression()."""
 import numpy as np
 import pennylane as qml
 import pytest
@@ -53,10 +53,24 @@ def test_k2_uses_the_tape(kw):
     assert p(THETA)[0] == pytest.approx(f(np.sin(THETA), np.cos(THETA)), abs=1e-12)
 
 
-def test_coeff_threshold_falls_back_to_the_old_engine():
-    p = Propagator(ansatz)
+def fixed_ansatz(params):
+    qml.RX(params[0], wires=0)
+    qml.RY(0.2, wires=1)                    # a fixed angle: constant factors the threshold can cut
+    qml.CNOT(wires=[0, 1])
+    qml.RY(0.4, wires=0)
+    return [qml.expval(qml.PauliZ(1))]
+
+
+def test_coeff_threshold_uses_the_tape():
+    p = Propagator(fixed_ansatz)
     p.propagate(coeff_threshold=0.5)
-    assert p.engine == "terms"
+    assert p.engine == "tape" and p.programs[0].n_dropped > 0
+    theta = np.array([0.7])
+
+    @qml.qnode(qml.device("default.qubit", wires=2))
+    def exact():
+        return fixed_ansatz(theta)
+    assert abs(p(theta)[0] - float(exact()[0])) <= p.programs[0].dropped_bound + 1e-12
 
 
 def test_values_and_gradients_match_the_old_engine():

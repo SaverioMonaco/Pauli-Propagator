@@ -106,7 +106,7 @@ mod tests {
 
     fn tape(n_boxes: u32, init: Vec<(u32, f64)>, steps: Vec<Step>, pairs: Vec<[u32; 2]>,
             blocks: Vec<Block>, block_progs: Vec<BlockProg>, readout: Vec<u32>) -> Tape {
-        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), singles: Vec::new(), blocks, block_progs, readout, k2: -1, sine_order: false }
+        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), singles: Vec::new(), blocks, block_progs, readout, k2: -1, sine_order: false, n_dropped: 0, dropped_bound: 0.0 }
     }
 
     /// A pair rotation written as a 2-member block: new a = c·a − s·b, new b = s·a + c·b.

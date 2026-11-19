@@ -136,12 +136,14 @@ fn evolve_single_gate_debug(
 /// Compile each observable into a `TapeProgram`, dropping words of Pauli
 /// weight above `k1` (-1: no limit) and, if asked, the words the exact pruners
 /// find dead; `k2` (-1: none) truncates the number of sin/cos factors (only
-/// sin with `sine_order`), as in the sum-of-terms engine.
+/// sin with `sine_order`), as in the sum-of-terms engine; `coeff_threshold`
+/// (-1: none) drops words whose coefficient can never reach it (see
+/// `tape::compile`), which differs from the sum-of-terms engine.
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts,
     k1 = -1, use_dead_qubit_pruner = false, use_xy_weight_pruner = false,
-    k2 = -1, sine_order = false,
+    k2 = -1, sine_order = false, coeff_threshold = -1.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn compile_tapes(
@@ -158,13 +160,14 @@ fn compile_tapes(
     use_xy_weight_pruner: bool,
     k2: i64,
     sine_order: bool,
+    coeff_threshold: f64,
 ) -> PyResult<Vec<TapeProgram>> {
     let nw = words_needed(num_qubits);
     py.allow_threads(move || {
         dispatch_nw!(
             nw, num_qubits, compile_tapes_impl,
             (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts,
-             k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
+             k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
         )
     })
 }
@@ -174,7 +177,7 @@ fn compile_tapes(
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
     k1 = -1, use_dead_qubit_pruner = false, use_xy_weight_pruner = false,
-    k2 = -1, sine_order = false,
+    k2 = -1, sine_order = false, coeff_threshold = -1.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn tape_debug(
@@ -191,12 +194,13 @@ fn tape_debug(
     use_xy_weight_pruner: bool,
     k2: i64,
     sine_order: bool,
+    coeff_threshold: f64,
 ) -> PyResult<PyObject> {
     let nw = words_needed(num_qubits);
     let debug = dispatch_nw!(
         nw, num_qubits, tape_debug_impl,
         (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
-         k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
+         k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
     )?;
     debug.into_dict(py)
 }
