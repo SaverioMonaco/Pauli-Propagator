@@ -17,6 +17,7 @@ import pytest
 import pprop_rs
 from pprop import Propagator
 from pprop.propagator import _GATE_KIND
+from pprop.propagator.evaluator import make_sparse_evaluator
 
 PAULI = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}
 ROTATIONS = ["RX", "RY", "RZ"]
@@ -103,7 +104,9 @@ def statevector(n, gates, observable, theta):
 
 
 def old_engine(gates, observable, theta, k1=None, dead=False, xy=False):
-    """observable: a word string, or [(word string, coeff)]."""
+    """The sum-of-terms engine's value. observable: a word string, or
+    [(word string, coeff)]. Propagator uses the tape by default, so this
+    evaluates its exprs, which always come from the sum-of-terms engine."""
     if isinstance(observable, str):
         observable = [(observable, 1.0)]
 
@@ -112,7 +115,8 @@ def old_engine(gates, observable, theta, k1=None, dead=False, xy=False):
         return [qml.expval(qml.dot([c for _, c in observable], [pauli_op(w) for w, _ in observable]))]
     prop = Propagator(ansatz, k1=k1)
     prop.propagate(n_threads=1, use_dead_qubit_pruner=dead, use_xy_weight_pruner=xy)
-    return float(np.ravel(prop(theta))[0])
+    f, _ = make_sparse_evaluator(prop.exprs[0], prop.num_params)
+    return float(f(np.sin(theta), np.cos(theta)))
 
 
 def random_word(rng, n):

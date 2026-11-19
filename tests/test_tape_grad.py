@@ -11,6 +11,7 @@ import pennylane as qml
 import pytest
 
 from pprop import Propagator
+from pprop.propagator.evaluator import make_sparse_evaluator
 from test_tape_eval import (apply, pauli_op, random_cr_case, tapes, with_params)
 
 
@@ -27,13 +28,16 @@ def numeric_grad(program, theta, eps=1e-6):
 
 
 def old_engine_value_and_grad(gates, observable, theta, k1=None, dead=False, xy=False):
+    """The sum-of-terms engine's value and gradient, from Propagator's exprs
+    (always computed by that engine; Propagator itself uses the tape)."""
     def ansatz(params):
         apply(gates, params)
         return [qml.expval(qml.dot([c for _, c in observable], [pauli_op(w) for w, _ in observable]))]
     prop = Propagator(ansatz, k1=k1)
     prop.propagate(n_threads=1, use_dead_qubit_pruner=dead, use_xy_weight_pruner=xy)
-    values, grads = prop.eval_and_grad(theta)
-    return float(np.ravel(values)[0]), np.asarray(grads)[0]
+    _, g = make_sparse_evaluator(prop.exprs[0], prop.num_params)
+    value, grad = g(np.sin(theta), np.cos(theta))
+    return float(value), np.asarray(grad)
 
 
 def every_gate_case(seed):
