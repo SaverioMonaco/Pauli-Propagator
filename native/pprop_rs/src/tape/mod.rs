@@ -69,7 +69,6 @@ pub(crate) enum Step {
     Negate { first: u32, last: u32 },
     /// Groups of up to 4 boxes, `blocks[first..last]`, each mixed by its
     /// `BlockProg` at this step's angle (a controlled rotation).
-    #[allow(dead_code)] // compiled from A7c-2 on
     Block { angle: Angle, first: u32, last: u32 },
 }
 

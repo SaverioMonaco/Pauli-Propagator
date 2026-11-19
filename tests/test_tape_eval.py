@@ -2,7 +2,8 @@
 statevectors and against the sum-of-terms engine.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-or fixed angles, T, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
+or fixed angles, T, the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP) and the
+controlled rotations (CRX, CRY, CRZ: parameter = θ/2, as everywhere in pprop), with the k1
 truncation (checked against the sum-of-terms engine: a statevector cannot
 truncate) and the two exact pruners.
 """
@@ -19,6 +20,7 @@ from pprop.propagator import _GATE_KIND
 
 PAULI = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}
 ROTATIONS = ["RX", "RY", "RZ"]
+CONTROLLED_ROTATIONS = ["CRX", "CRY", "CRZ"]
 CLIFFORD_1Q = ["Hadamard", "S", "SX"]
 CLIFFORD_2Q = ["CNOT", "CY", "CZ", "SWAP"]
 
@@ -39,7 +41,7 @@ def with_params(gates):
         g, w = gate[0], gate[1]
         if len(gate) == 3:
             out.append((g, w, -1, float(gate[2])))
-        elif g in ROTATIONS:
+        elif g in ROTATIONS or g in CONTROLLED_ROTATIONS:
             out.append((g, w, p, None))
             p += 1
         else:
@@ -73,12 +75,17 @@ def pauli_op(word):
     return qml.prod(*ops) if len(ops) > 1 else ops[0]
 
 
-def apply(gates, theta):
+def apply(gates, theta, statevector=False):
+    """Put the gates on the tape of the current QNode. pprop's convention for
+    a trainable controlled rotation: the parameter is θ/2, so the statevector
+    needs CRX(2·θ[p]) where pprop's ansatz has CRX(θ[p]). A fixed angle is
+    the real angle for both."""
     gates, _ = with_params(gates)
     for g, w, p, fixed in gates:
         wires = list(w) if isinstance(w, tuple) else w
         if p >= 0:
-            getattr(qml, g)(theta[p], wires=wires)
+            angle = 2 * theta[p] if statevector and g in CONTROLLED_ROTATIONS else theta[p]
+            getattr(qml, g)(angle, wires=wires)
         elif fixed is not None:
             getattr(qml, g)(fixed, wires=wires)
         else:
@@ -90,7 +97,7 @@ def statevector(n, gates, observable, theta):
 
     @qml.qnode(dev)
     def f():
-        apply(gates, theta)
+        apply(gates, theta, statevector=True)
         return [qml.expval(pauli_op(w)) for w, _ in observable]
     return float(sum(c * v for (_, c), v in zip(observable, np.atleast_1d(f()))))
 
@@ -354,6 +361,76 @@ def test_t_gates_match_statevector_and_old_engine(seed):
     (program,) = tapes(n, gates, [observable], k1=k1, dead=True, xy=True)
     assert tape_value(program, theta) == pytest.approx(
         old_engine(gates, observable, theta, k1=k1, dead=True, xy=True), abs=1e-12)
+
+
+CR_ON_2_QUBITS = [(g, w) for g in CONTROLLED_ROTATIONS for w in ((0, 1), (1, 0))]
+
+
+@pytest.mark.parametrize("gate", CR_ON_2_QUBITS, ids=lambda g: f"{g[0]}{g[1]}")
+def test_every_controlled_rotation_on_every_word(gate):
+    layer = [("RX", 0), ("RY", 0), ("RX", 1), ("RY", 1)]
+    gates = layer + [gate] + layer
+    theta = np.random.default_rng(4).uniform(-np.pi, np.pi, 9)
+    for word in WORDS_2:
+        (program,) = tapes(2, gates, [[(word, 1.0)]])
+        assert tape_value(program, theta) == pytest.approx(
+            statevector(2, gates, [(word, 1.0)], theta), abs=1e-12), word
+
+
+def random_cr_case(seed, fixed=False):
+    """A random mixed circuit with controlled rotations put in at random
+    places; with `fixed`, some of them get a fixed angle (some at quarter turns)."""
+    n, gates, observable, _ = random_case(seed)
+    rng = random.Random(3000 + seed)
+    out = []
+    for gate in gates:
+        if rng.random() < 0.35:
+            g, w = rng.choice(CONTROLLED_ROTATIONS), tuple(rng.sample(range(n), 2))
+            if fixed and rng.random() < 0.5:
+                angle = rng.choice([0.0, np.pi, -np.pi / 2]) if rng.random() < 0.3 else rng.uniform(-np.pi, np.pi)
+                out.append((g, w, angle))
+            else:
+                out.append((g, w))
+        out.append(gate)
+    _, n_params = with_params(out)
+    theta = np.random.default_rng(seed).uniform(-np.pi, np.pi, n_params)
+    return n, out, observable, theta
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_controlled_rotations_match_statevector_and_old_engine(seed):
+    n, gates, observable, theta = random_cr_case(seed)
+    (program,) = tapes(n, gates, [observable])
+    value = tape_value(program, theta)
+    assert value == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
+    assert value == pytest.approx(old_engine(gates, observable, theta), abs=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_controlled_rotations_with_k1_and_pruners_match_old_engine(seed):
+    n, gates, observable, theta = random_cr_case(seed, fixed=True)
+    rng = random.Random(seed)
+    k1, dead, xy = rng.randint(1, n), rng.random() < 0.5, rng.random() < 0.5
+    (program,) = tapes(n, gates, [observable], k1=k1, dead=dead, xy=xy)
+    assert tape_value(program, theta) == pytest.approx(
+        old_engine(gates, observable, theta, k1=k1, dead=dead, xy=xy), abs=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(15))
+def test_fixed_controlled_rotations_match_statevector(seed):
+    n, gates, observable, theta = random_cr_case(seed, fixed=True)
+    (program,) = tapes(n, gates, [observable])
+    assert tape_value(program, theta) == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
+
+
+def test_controlled_rotation_makes_a_heavy_observable_word_light():
+    # ZZ is too heavy for k1 = 1, and CRX(0 -> 1) as the first gate turns ZZ
+    # partly into IZ: kept through that gate, as in the sum-of-terms engine.
+    gates = [("RY", 0), ("CRX", (0, 1))]
+    theta = np.array([0.4, 0.9])
+    (program,) = tapes(2, gates, [[("ZZ", 1.0)]], k1=1)
+    assert tape_value(program, theta) == pytest.approx(old_engine(gates, "ZZ", theta, k1=1), abs=1e-12)
+    assert abs(tape_value(program, theta)) > 1e-3
 
 
 def test_several_observables_and_several_thetas():

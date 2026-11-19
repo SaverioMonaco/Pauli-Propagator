@@ -1,8 +1,8 @@
 """The tape compiler (pprop_rs.tape_debug), checked before tapes can be evaluated.
 
-So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
-truncation and the two exact pruners.
+The tape compiles every gate pprop supports: RX, RY, RZ (trainable or fixed),
+T, the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP) and the controlled
+rotations (CRX, CRY, CRZ), with the k1 truncation and the two exact pruners.
 """
 import random
 
@@ -212,6 +212,24 @@ def test_t_gate_is_a_fixed_rz_pair():
     assert out["steps"] == []
 
 
-def test_gates_not_supported_yet():
-    with pytest.raises(ValueError, match="cannot compile gate kind"):
-        pprop_rs.tape_debug(2, [_GATE_KIND["CRX"]], [0], [1], [0], [None], [([0], [2], 1.0, [], [])])
+def test_controlled_rotation_is_a_block():
+    # CRX(0 -> 1) on IZ: IZ belongs to CRX's group of 4 (IZ, IY, ZZ, ZY), so
+    # one block whose other members are new boxes.
+    t = compile_tape(2, [("CRX", (0, 1), 0)], [("IZ", 1.0)])
+    assert t["steps"] == [("block", 0, 0, 1)]
+    ((prog, members),) = t["blocks"]
+    assert [t["words"][m] for m in members] == ["IZ", "IY", "ZZ", "ZY"]
+    assert t["block_progs"][prog][0] == 4
+    # With k1 = 1, ZZ and ZY are too heavy: those members are NONE (-1).
+    t = compile_tape(2, [("CRX", (0, 1), 0)], [("IZ", 1.0)], k1=1)
+    ((prog, members),) = t["blocks"]
+    assert [t["words"][m] for m in members[:2]] == ["IZ", "IY"] and members[2:] == [-1, -1]
+    # CRX on XI: a 2-member group (XI, YX).
+    t = compile_tape(2, [("CRX", (0, 1), 0)], [("XI", 1.0)])
+    ((prog, members),) = t["blocks"]
+    assert sorted(t["words"][m] for m in members) == ["XI", "YX"] and t["block_progs"][prog][0] == 2
+
+
+def test_fixed_controlled_rotation_is_a_fixed_block():
+    d = pprop_rs.tape_debug(2, [_GATE_KIND["CRY"]], [0], [1], [-1], [0.8], [([0], [2], 1.0, [], [])])
+    assert d["steps"] == [("block_fixed", -1, 0, 1)]

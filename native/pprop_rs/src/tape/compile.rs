@@ -14,11 +14,19 @@
 //! Clifford gate can make a word too heavy; its box is dropped (it leaves the
 //! word table, and its value is never read again).
 //!
+//! A controlled rotation (CRX, CRY, CRZ) is compiled into blocks: its rule
+//! table splits the words it changes into groups of 2 or 4 that mix among
+//! themselves (one `BlockProg` per group, built from the table), and every
+//! such group of existing words becomes a `Block`. Its members can differ in
+//! weight, so a member too heavy for k1 is `NONE`. The angle is the half
+//! angle, as everywhere in pprop for these gates: a trainable parameter is
+//! already θ/2, a fixed angle is halved here.
+//!
 //! The two exact pruners (dead qubit, XY weight) drop a word that can never
 //! reach the readout. As in the sum-of-terms engine, a word is checked just
 //! before a gate that changes it, against the gates from that one on.
 
-use super::{Angle, Step, Tape};
+use super::{Angle, Block, BlockProg, Step, Tape, NONE};
 use crate::gates::*;
 use crate::pauli::*;
 use crate::pruning::*;
@@ -195,6 +203,8 @@ pub(crate) fn compile<const NW: usize>(
         mask_or_assign(&mut obs_support, &mask_or(&w.0, &w.1));
     }
     let mut observable_cut = false;
+    // The groups of each controlled-rotation kind, built when first needed.
+    let mut cr_groups: FxHashMap<u8, CrGroups> = FxHashMap::default();
 
     for (i, gate) in gates.iter().rev().enumerate() {
         let pruned_here = |w: &PauliKey<NW>| pruned(w, i);
@@ -226,6 +236,9 @@ pub(crate) fn compile<const NW: usize>(
             if last > first {
                 tape.steps.push(Step::Negate { first, last });
             }
+        } else if is_controlled_rotation(gate.kind) {
+            let groups = cr_groups.entry(gate.kind).or_insert_with(|| CrGroups::new(gate.kind, &mut tape));
+            controlled_rotation_step(gate, groups, &mut boxes, &mut tape, &too_heavy, &pruned_here);
         } else {
             rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here)?;
         }
@@ -313,4 +326,131 @@ fn rotation_step<const NW: usize>(
         tape.steps.push(Step::Rotate { angle, first, last });
     }
     Ok(())
+}
+
+fn is_controlled_rotation(kind: u8) -> bool {
+    matches!(kind, CRX | CRY | CRZ)
+}
+
+fn cr_rule_of(kind: u8) -> fn(u8) -> Option<CRRule> {
+    match kind {
+        CRX => crx_rule,
+        CRY => cry_rule,
+        CRZ => crz_rule,
+        _ => unreachable!("not a controlled rotation: kind {}", kind),
+    }
+}
+
+/// The groups of one controlled-rotation kind. A word's two letters on the
+/// gate's (control, target) give its code `control << 2 | target`; the codes
+/// the rule table changes split into groups that only mix among themselves
+/// (CRX: one group of 4 with control I/Z, four pairs with control X/Y).
+struct CrGroups {
+    /// Per group: the codes of its members, in member order, and its prog.
+    groups: Vec<(Vec<u8>, u32)>,
+    /// Per code: (its group, its member position), or None if unchanged.
+    of_code: [Option<(usize, usize)>; 16],
+}
+
+impl CrGroups {
+    /// Find the groups of `kind`'s rule table and add one `BlockProg` per
+    /// group to `tape`. An entry `code -> coeff·sⁿ·cᵐ·out` of the table becomes
+    /// the prog entry `(out member, code member, coeff, n, m)`.
+    fn new(kind: u8, tape: &mut Tape) -> Self {
+        let rule = cr_rule_of(kind);
+        let mut of_code: [Option<(usize, usize)>; 16] = [None; 16];
+        let mut groups: Vec<(Vec<u8>, u32)> = Vec::new();
+        for start in 0..16u8 {
+            if rule(start).is_none() || of_code[start as usize].is_some() {
+                continue;
+            }
+            // Everything reachable from `start` through the table is one group.
+            let mut members = vec![start];
+            let mut i = 0;
+            while i < members.len() {
+                for &(oc, ot, ..) in rule(members[i]).unwrap() {
+                    let out = (oc << 2) | ot;
+                    if !members.contains(&out) {
+                        members.push(out);
+                    }
+                }
+                i += 1;
+            }
+            members.sort_unstable();
+            assert!(members.len() <= 4, "pprop_rs: a controlled-rotation group has more than 4 words");
+            let g = groups.len();
+            let mut entries = Vec::new();
+            for (pos, &code) in members.iter().enumerate() {
+                of_code[code as usize] = Some((g, pos));
+                for &(oc, ot, coeff, n_sin, n_cos) in rule(code).unwrap() {
+                    let out = members.iter().position(|&m| m == (oc << 2) | ot).unwrap();
+                    entries.push((out as u8, pos as u8, coeff, n_sin, n_cos));
+                }
+            }
+            let prog = tape.block_progs.len() as u32;
+            tape.block_progs.push(BlockProg { size: members.len() as u8, entries });
+            groups.push((members, prog));
+        }
+        CrGroups { groups, of_code }
+    }
+}
+
+/// One controlled rotation: every group of words it changes becomes a block.
+/// A visited word the pruners reject is dropped; the other members are not
+/// checked (as for rotations: what a rejected word contributes adds 0 to the
+/// readout anyway). A member that does not exist yet gets a new box at 0, or
+/// `NONE` if it is too heavy for k1.
+fn controlled_rotation_step<const NW: usize>(
+    gate: &GateSpec<NW>,
+    groups: &CrGroups,
+    boxes: &mut Boxes<NW>,
+    tape: &mut Tape,
+    too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
+    pruned: &impl Fn(&PauliKey<NW>) -> bool,
+) {
+    let (control, target) = (gate.wire0, gate.wire1 as u32);
+    let angle = if gate.param >= 0 {
+        Angle::Param(gate.param as u32)
+    } else {
+        // Fixed angle: the rule tables are in θ/2.
+        let (sin, cos) = fixed_sin_cos(gate.fixed.expect("a controlled rotation has a parameter or an angle") / 2.0);
+        Angle::Fixed { cos, sin }
+    };
+    let step = tape.steps.len() as u32 + 1;
+    let first = tape.blocks.len() as u32;
+
+    for b in 0..boxes.len() {
+        if !boxes.alive[b] || boxes.stamp[b] == step {
+            continue;
+        }
+        let (x, z) = boxes.words[b];
+        let code = (pauli_label(&x, &z, control) << 2) | pauli_label(&x, &z, target);
+        let Some((g, _)) = groups.of_code[code as usize] else {
+            continue; // the gate leaves this word as it is
+        };
+        if pruned(&boxes.words[b]) {
+            boxes.drop_box(b);
+            continue;
+        }
+        let (codes, prog) = &groups.groups[g];
+        let mut members = [NONE; 4];
+        for (m, &c) in codes.iter().enumerate() {
+            let (mx, mz) = set_label(x, z, control, c >> 2);
+            let word = set_label(mx, mz, target, c & 3);
+            members[m] = match boxes.index.get(&word) {
+                Some(&existing) => existing,
+                None if too_heavy(&word) => NONE,
+                None => boxes.get_or_new(word),
+            };
+            if members[m] != NONE {
+                boxes.stamp[members[m] as usize] = step;
+            }
+        }
+        tape.blocks.push(Block { prog: *prog, members });
+    }
+
+    let last = tape.blocks.len() as u32;
+    if last > first {
+        tape.steps.push(Step::Block { angle, first, last });
+    }
 }
