@@ -1,7 +1,7 @@
 """The tape compiler (pprop_rs.tape_debug), checked before tapes can be evaluated.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles only.
+angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP).
 """
 import random
 
@@ -21,21 +21,24 @@ def word_str(x, z, n):
 
 
 def compile_tape(n, gates, observable):
-    """gates: [(name, qubit, param index)] in circuit order.
-    observable: [(word string, coefficient)]."""
+    """gates: [(name, wires, param index)] in circuit order; wires is a qubit or
+    a (control, target) pair; param is -1 for a Clifford gate.
+    observable: [(word string, coefficient)].
+    Steps come back as ("rotate", param, first, last) or ("negate", -1, first, last)."""
     def bits(word, letters):
         return [sum(1 << q for q, ch in enumerate(word) if ch in letters)]
+    wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     obs = [(bits(w, "XY"), bits(w, "ZY"), c, [], []) for w, c in observable]
-    n_boxes, init, steps, pairs, readout, words = pprop_rs.tape_debug(
+    n_boxes, init, steps, pairs, negs, readout, words = pprop_rs.tape_debug(
         n,
         [_GATE_KIND[g] for g, _, _ in gates],
-        [q for _, q, _ in gates],
-        [-1] * len(gates),
+        [w0 for w0, _ in wires],
+        [w1 for _, w1 in wires],
         [p for _, _, p in gates],
         [None] * len(gates),
         obs,
     )
-    return dict(n_boxes=n_boxes, init=init, steps=steps, pairs=pairs, readout=readout,
+    return dict(n_boxes=n_boxes, init=init, steps=steps, pairs=pairs, negs=negs, readout=readout,
                 words=[word_str(x, z, n) for x, z in words])
 
 
@@ -49,7 +52,7 @@ def test_example_by_hand():
     assert t["words"] == ["IZ", "IY", "IX"]
     assert t["n_boxes"] == 3
     assert t["init"] == [(0, 1.0)]
-    assert t["steps"] == [(2, 0, 1), (1, 1, 2)]
+    assert t["steps"] == [("rotate", 2, 0, 1), ("rotate", 1, 1, 2)]
     assert t["pairs"] == [(0, 1), (2, 0)]
     assert t["readout"] == [0]
 
@@ -59,7 +62,7 @@ def test_pair_seen_from_both_sides_is_written_once():
     # pair from IZ and from IY, and must write it once.
     t = compile_tape(1, [("RX", 0, 0), ("RX", 0, 1)], [("Z", 1.0)])
     assert t["words"] == ["Z", "Y"]
-    assert t["steps"] == [(1, 0, 1), (0, 1, 2)]
+    assert t["steps"] == [("rotate", 1, 0, 1), ("rotate", 0, 1, 2)]
     assert t["pairs"] == [(0, 1), (0, 1)]
 
 
@@ -79,7 +82,8 @@ def test_random_rotation_circuits(seed):
     assert len(set(words)) == len(words) == t["n_boxes"]
 
     by_param = {p: (g, q) for g, q, p in gates}
-    for p, first, last in t["steps"]:
+    for kind, p, first, last in t["steps"]:
+        assert kind == "rotate"
         gate, q = by_param[p]
         step_pairs = t["pairs"][first:last]
         boxes = [b for pair in step_pairs for b in pair]
@@ -91,13 +95,46 @@ def test_random_rotation_circuits(seed):
             assert [i for i in range(n) if wa[i] != wb[i]] == [q]
             assert (wa[q], wb[q]) == PAIR_LETTERS[gate]
     # Gates are walked in reverse, so the steps come in reverse parameter order.
-    order = [p for p, _, _ in t["steps"]]
+    order = [p for _, p, _, _ in t["steps"]]
     assert order == sorted(order, reverse=True)
     assert t["readout"] == [b for b, w in enumerate(words) if set(w) <= {"I", "Z"}]
 
 
+def test_cnot_renames_boxes():
+    # The two-qubit example: RX(θ0) q0, RX(θ1) q1, CNOT(0 -> 1), RX(θ2) q0, RX(θ3) q1, <Z1>.
+    # Backwards: RX(θ3) pairs IZ with IY; RX(θ2) touches nothing; the CNOT
+    # renames IZ -> ZZ and IY -> ZY (no sign, no step); RX(θ1) mixes the pair
+    # (ZZ, ZY); RX(θ0) pairs ZZ with YZ and ZY with YY.
+    gates = [("RX", 0, 0), ("RX", 1, 1), ("CNOT", (0, 1), -1), ("RX", 0, 2), ("RX", 1, 3)]
+    t = compile_tape(2, gates, [("IZ", 1.0)])
+    assert t["words"] == ["ZZ", "ZY", "YZ", "YY"]
+    assert t["steps"] == [("rotate", 3, 0, 1), ("rotate", 1, 1, 2), ("rotate", 0, 2, 4)]
+    assert t["pairs"] == [(0, 1), (0, 1), (0, 2), (1, 3)]
+    assert t["negs"] == []
+    assert t["readout"] == [0]
+
+
+def test_clifford_minus_sign_is_a_negate_step():
+    # H turns Y into −Y: the box keeps its word and gets negated.
+    t = compile_tape(1, [("Hadamard", 0, -1)], [("Y", 1.0)])
+    assert t["words"] == ["Y"]
+    assert t["steps"] == [("negate", -1, 0, 1)] and t["negs"] == [0]
+    # H turns X into Z: renamed, no sign, no step.
+    t = compile_tape(1, [("Hadamard", 0, -1)], [("X", 1.0)])
+    assert t["words"] == ["Z"] and t["steps"] == [] and t["readout"] == [0]
+
+
+def test_swap_exchanges_names_in_one_go():
+    # Both words exist before the SWAP and swap names: renaming one at a time
+    # would make the first new name collide with the second old one.
+    t = compile_tape(2, [("SWAP", (0, 1), -1)], [("XZ", 1.0), ("ZX", 2.0)])
+    assert t["words"] == ["ZX", "XZ"]
+    assert t["init"] == [(0, 1.0), (1, 2.0)]
+    assert t["steps"] == []
+
+
 def test_gates_not_supported_yet():
     with pytest.raises(ValueError, match="cannot compile gate kind"):
-        pprop_rs.tape_debug(2, [_GATE_KIND["CNOT"]], [0], [1], [-1], [None], [([0], [2], 1.0, [], [])])
+        pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([0], [1], 1.0, [], [])])
     with pytest.raises(ValueError, match="fixed angle"):
         pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [-1], [0.3], [([0], [1], 1.0, [], [])])

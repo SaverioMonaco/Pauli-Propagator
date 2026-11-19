@@ -5,7 +5,8 @@
 //! sum-of-terms engine, but a Pauli word carries no terms: only its box
 //! number. For every rotation, each word the gate changes is paired with the
 //! word it turns into, and the pair is written to the tape as `[a, b]` (see
-//! the module doc in `mod.rs` for the order).
+//! the module doc in `mod.rs` for the order). A Clifford gate only renames
+//! words, and records the boxes whose sign flips.
 
 use super::{Angle, Step, Tape};
 use crate::gates::*;
@@ -45,6 +46,61 @@ impl<const NW: usize> Boxes<NW> {
         self.stamp.push(0);
         b
     }
+
+    /// Give boxes new words, all at once: a Clifford gate is a one-to-one map
+    /// of words, so two boxes can swap names (SWAP turns XZ into ZX and ZX
+    /// into XZ). All old names are removed first, then the new ones added.
+    fn rename(&mut self, renames: &[(usize, PauliKey<NW>)]) {
+        for &(b, _) in renames {
+            self.index.remove(&self.words[b]);
+        }
+        for &(b, word) in renames {
+            self.words[b] = word;
+            let previous = self.index.insert(word, b as u32);
+            assert!(previous.is_none(), "pprop_rs: a Clifford gate gave two boxes the same word");
+        }
+    }
+}
+
+fn is_clifford(kind: u8) -> bool {
+    matches!(kind, H | S | SX | SWAP | CNOT | CY | CZ)
+}
+
+/// What a Clifford `gate` makes of `word`: its new word and sign, or `None`
+/// if the gate leaves it as it is. Same rule tables as the sum-of-terms
+/// engine (`evolve_clifford1q`, `evolve_controlled`, `evolve_swap`).
+fn clifford_image<const NW: usize>(gate: &GateSpec<NW>, word: PauliKey<NW>) -> Option<(PauliKey<NW>, i8)> {
+    let (x, z) = word;
+    let w0 = gate.wire0;
+    let one = |rule: fn(u8) -> Option<(u8, i8)>| {
+        rule(pauli_label(&x, &z, w0)).map(|(out, sign)| (set_label(x, z, w0, out), sign))
+    };
+    let two = |rule: fn(u8) -> Option<(u8, u8, i8)>| {
+        let w1 = gate.wire1 as u32;
+        let code = (pauli_label(&x, &z, w0) << 2) | pauli_label(&x, &z, w1);
+        rule(code).map(|(out_c, out_t, sign)| {
+            let (nx, nz) = set_label(x, z, w0, out_c);
+            (set_label(nx, nz, w1, out_t), sign)
+        })
+    };
+    match gate.kind {
+        H => one(h_rule),
+        S => one(s_rule),
+        SX => one(sx_rule),
+        CNOT => two(cnot_rule),
+        CY => two(cy_rule),
+        CZ => two(cz_rule),
+        SWAP => {
+            let w1 = gate.wire1 as u32;
+            let (l0, l1) = (pauli_label(&x, &z, w0), pauli_label(&x, &z, w1));
+            if l0 == l1 {
+                return None;
+            }
+            let (nx, nz) = set_label(x, z, w0, l1);
+            Some((set_label(nx, nz, w1, l0), 1))
+        }
+        _ => unreachable!("not a Clifford gate: kind {}", gate.kind),
+    }
 }
 
 /// The rule table of a one-qubit rotation, or `None` for a gate the tape
@@ -70,6 +126,7 @@ pub(crate) fn compile<const NW: usize>(
         init: Vec::new(),
         steps: Vec::new(),
         pairs: Vec::new(),
+        negs: Vec::new(),
         readout: Vec::new(),
     };
 
@@ -84,6 +141,28 @@ pub(crate) fn compile<const NW: usize>(
     }
 
     for gate in gates.iter().rev() {
+        if is_clifford(gate.kind) {
+            // Rename every word the gate changes; remember the minus signs.
+            let first = tape.negs.len() as u32;
+            let mut renames = Vec::new();
+            for b in 0..boxes.len() {
+                if let Some((word, sign)) = clifford_image(gate, boxes.words[b]) {
+                    if sign < 0 {
+                        tape.negs.push(b as u32);
+                    }
+                    if word != boxes.words[b] {
+                        renames.push((b, word));
+                    }
+                }
+            }
+            boxes.rename(&renames);
+            let last = tape.negs.len() as u32;
+            if last > first {
+                tape.steps.push(Step::Negate { first, last });
+            }
+            continue;
+        }
+
         let rule = rotation_rule(gate.kind)
             .ok_or_else(|| format!("the tape cannot compile gate kind {} yet", gate.kind))?;
         if gate.param < 0 {
@@ -116,7 +195,7 @@ pub(crate) fn compile<const NW: usize>(
 
         let last = tape.pairs.len() as u32;
         if last > first {
-            tape.steps.push(Step { angle: Angle::Param(gate.param as u32), first, last });
+            tape.steps.push(Step::Rotate { angle: Angle::Param(gate.param as u32), first, last });
         }
     }
 

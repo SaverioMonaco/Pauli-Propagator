@@ -2,8 +2,9 @@
 statevectors and against the sum-of-terms engine.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-angles only.
+angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP).
 """
+import itertools
 import random
 
 import numpy as np
@@ -15,6 +16,9 @@ from pprop import Propagator
 from pprop.propagator import _GATE_KIND
 
 PAULI = {"X": qml.PauliX, "Y": qml.PauliY, "Z": qml.PauliZ}
+ROTATIONS = ["RX", "RY", "RZ"]
+CLIFFORD_1Q = ["Hadamard", "S", "SX"]
+CLIFFORD_2Q = ["CNOT", "CY", "CZ", "SWAP"]
 
 
 def obs_spec(observable):
@@ -24,14 +28,28 @@ def obs_spec(observable):
     return [(bits(w, "XY"), bits(w, "ZY"), c, [], []) for w, c in observable]
 
 
+def with_params(gates):
+    """gates: [(name, wires)] in circuit order, wires a qubit or a (control,
+    target) pair -> [(name, wires, param)], the rotations numbered 0, 1, ..."""
+    out, p = [], 0
+    for g, w in gates:
+        if g in ROTATIONS:
+            out.append((g, w, p))
+            p += 1
+        else:
+            out.append((g, w, -1))
+    return out, p
+
+
 def tapes(n, gates, observables):
-    """gates: [(name, qubit)] in circuit order, angle p for gate p."""
+    gates, _ = with_params(gates)
+    wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     return pprop_rs.compile_tapes(
         n,
-        [_GATE_KIND[g] for g, _ in gates],
-        [q for _, q in gates],
-        [-1] * len(gates),
-        list(range(len(gates))),
+        [_GATE_KIND[g] for g, _, _ in gates],
+        [w0 for w0, _ in wires],
+        [w1 for _, w1 in wires],
+        [p for _, _, p in gates],
         [None] * len(gates),
         [obs_spec(o) for o in observables],
     )
@@ -46,38 +64,58 @@ def pauli_op(word):
     return qml.prod(*ops) if len(ops) > 1 else ops[0]
 
 
+def apply(gates, theta):
+    gates, _ = with_params(gates)
+    for g, w, p in gates:
+        wires = list(w) if isinstance(w, tuple) else w
+        if p >= 0:
+            getattr(qml, g)(theta[p], wires=wires)
+        else:
+            getattr(qml, g)(wires=wires)
+
+
 def statevector(n, gates, observable, theta):
     dev = qml.device("default.qubit", wires=n)
 
     @qml.qnode(dev)
     def f():
-        for p, (g, q) in enumerate(gates):
-            getattr(qml, g)(theta[p], wires=q)
+        apply(gates, theta)
         return [qml.expval(pauli_op(w)) for w, _ in observable]
     return float(sum(c * v for (_, c), v in zip(observable, np.atleast_1d(f()))))
 
 
-def old_engine(n, gates, word, theta):
+def old_engine(gates, word, theta):
     def ansatz(params):
-        for p, (g, q) in enumerate(gates):
-            getattr(qml, g)(params[p], wires=q)
+        apply(gates, params)
         return [qml.expval(pauli_op(word))]
     prop = Propagator(ansatz)
     prop.propagate(n_threads=1)
     return float(np.ravel(prop(theta))[0])
 
 
-def random_case(seed):
-    rng = random.Random(seed)
-    n = rng.randint(1, 4)
-    gates = [(rng.choice(["RX", "RY", "RZ"]), rng.randrange(n)) for _ in range(rng.randint(1, 12))]
-    words = set()
-    while len(words) < rng.randint(1, 3):
+def random_word(rng, n):
+    while True:
         w = "".join(rng.choice("IXYZ") for _ in range(n))
         if set(w) != {"I"}:
-            words.add(w)
-    observable = [(w, rng.uniform(-1, 1)) for w in sorted(words)]
-    theta = np.random.default_rng(seed).uniform(-np.pi, np.pi, len(gates))
+            return w
+
+
+def random_case(seed, cliffords=True):
+    rng = random.Random(seed)
+    n = rng.randint(2 if cliffords else 1, 4)
+    gates = []
+    for _ in range(rng.randint(1, 16)):
+        kind = rng.choice(["rot", "rot", "c1", "c2"] if cliffords else ["rot"])
+        if kind == "rot":
+            gates.append((rng.choice(ROTATIONS), rng.randrange(n)))
+        elif kind == "c1":
+            gates.append((rng.choice(CLIFFORD_1Q), rng.randrange(n)))
+        else:
+            gates.append((rng.choice(CLIFFORD_2Q), tuple(rng.sample(range(n), 2))))
+    words = sorted({random_word(rng, n) for _ in range(rng.randint(1, 3))})
+    observable = [(w, rng.uniform(-1, 1)) for w in words]
+    _, n_params = with_params(gates)
+    theta = np.random.default_rng(seed).uniform(-np.pi, np.pi, n_params)
     return n, gates, observable, theta
 
 
@@ -93,18 +131,60 @@ def test_example_by_hand():
 
 
 @pytest.mark.parametrize("seed", range(30))
-def test_random_circuits_match_statevector(seed):
+def test_random_rotation_circuits_match_statevector(seed):
+    n, gates, observable, theta = random_case(seed, cliffords=False)
+    (program,) = tapes(n, gates, [observable])
+    assert tape_value(program, theta) == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
+
+
+GATE_ON_2_QUBITS = [(g, q) for g in CLIFFORD_1Q for q in (0, 1)] + \
+                   [(g, w) for g in CLIFFORD_2Q for w in ((0, 1), (1, 0))]
+WORDS_2 = ["".join(w) for w in itertools.product("IXYZ", repeat=2) if w != ("I", "I")]
+
+
+@pytest.mark.parametrize("gate", GATE_ON_2_QUBITS, ids=lambda g: f"{g[0]}{g[1]}")
+def test_every_clifford_on_every_word(gate):
+    # A rotation layer before and after, so every word reaches the Clifford
+    # with a nonzero coefficient, and every rule entry (with its sign) matters.
+    layer = [("RX", 0), ("RY", 0), ("RX", 1), ("RY", 1)]
+    gates = layer + [gate] + layer
+    theta = np.random.default_rng(1).uniform(-np.pi, np.pi, 8)
+    for word in WORDS_2:
+        (program,) = tapes(2, gates, [[(word, 1.0)]])
+        assert tape_value(program, theta) == pytest.approx(
+            statevector(2, gates, [(word, 1.0)], theta), abs=1e-12), word
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_mixed_circuits_match_statevector(seed):
     n, gates, observable, theta = random_case(seed)
     (program,) = tapes(n, gates, [observable])
     assert tape_value(program, theta) == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
 
 
 @pytest.mark.parametrize("seed", range(10))
-def test_random_circuits_match_old_engine(seed):
+def test_random_mixed_circuits_match_old_engine(seed):
     n, gates, observable, theta = random_case(seed)
     word, _ = observable[0]
     (program,) = tapes(n, gates, [[(word, 1.0)]])
-    assert tape_value(program, theta) == pytest.approx(old_engine(n, gates, word, theta), abs=1e-12)
+    assert tape_value(program, theta) == pytest.approx(old_engine(gates, word, theta), abs=1e-12)
+
+
+def test_brickwork():
+    # The benchmark's circuit: RX and RY on every qubit, then CNOTs on
+    # alternating pairs; 6 qubits, 3 layers, Z on the middle qubit.
+    n, L = 6, 3
+    gates = []
+    for layer in range(L):
+        for q in range(n):
+            gates += [("RX", q), ("RY", q)]
+        gates += [("CNOT", (q, q + 1)) for q in range(layer % 2, n - 1, 2)]
+    word = "I" * (n // 2) + "Z" + "I" * (n - n // 2 - 1)
+    theta = np.random.default_rng(0).uniform(-np.pi, np.pi, 2 * n * L)
+    (program,) = tapes(n, gates, [[(word, 1.0)]])
+    expected = statevector(n, gates, [(word, 1.0)], theta)
+    assert tape_value(program, theta) == pytest.approx(expected, abs=1e-12)
+    assert tape_value(program, theta) == pytest.approx(old_engine(gates, word, theta), abs=1e-12)
 
 
 def test_several_observables_and_several_thetas():
@@ -112,9 +192,10 @@ def test_several_observables_and_several_thetas():
     observables = [[("Z" * n, 1.0)], [("X" + "I" * (n - 1), 0.5)], [("Y" * n, -2.0), ("Z" * n, 0.25)]]
     programs = tapes(n, gates, observables)
     assert len(programs) == 3
+    _, n_params = with_params(gates)
     rng = np.random.default_rng(7)
     for _ in range(3):                       # the same tapes, new angles each time
-        theta = rng.uniform(-np.pi, np.pi, len(gates))
+        theta = rng.uniform(-np.pi, np.pi, n_params)
         for program, observable in zip(programs, observables):
             assert tape_value(program, theta) == pytest.approx(
                 statevector(n, gates, observable, theta), abs=1e-12)

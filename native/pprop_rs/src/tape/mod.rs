@@ -21,15 +21,20 @@
 //! ```text
 //! boxes:   0 = IZ (ZZ after the CNOT)   1 = IY (ZY after the CNOT)   2 = YZ   3 = YY
 //! init:    [(0, 1.0)]
-//! steps:   [Step(Param(3), 0..1),   RX(θ3) on q1
-//!           Step(Param(1), 1..2),   RX(θ1) on q1
-//!           Step(Param(0), 2..4)]   RX(θ0) on q0
+//! steps:   [Rotate(Param(3), 0..1),   RX(θ3) on q1
+//!           Rotate(Param(1), 1..2),   RX(θ1) on q1
+//!           Rotate(Param(0), 2..4)]   RX(θ0) on q0
 //! pairs:   [[0, 1], [0, 1], [0, 2], [1, 3]]
 //! readout: [0]
 //! ```
 //!
 //! RX(θ2) touches no word and the CNOT only renames boxes while compiling,
 //! so neither leaves a step.
+//!
+//! A Clifford gate (H, S, SX, CNOT, CY, CZ, SWAP) never mixes words: it turns
+//! each word into exactly one other word, sometimes with a minus sign. The
+//! compiler renames the boxes (a box keeps its number, its word changes), and
+//! the minus signs become a `Negate` step listing the boxes to multiply by −1.
 
 mod compile;
 mod eval;
@@ -51,12 +56,12 @@ pub(crate) enum Angle {
     Fixed { cos: f64, sin: f64 },
 }
 
-/// One rotation gate: its angle, and the pairs of boxes it mixes,
-/// `pairs[first..last]`.
-pub(crate) struct Step {
-    pub(crate) angle: Angle,
-    pub(crate) first: u32,
-    pub(crate) last: u32,
+/// One step of the tape.
+pub(crate) enum Step {
+    /// A rotation: its angle, and the pairs of boxes it mixes, `pairs[first..last]`.
+    Rotate { angle: Angle, first: u32, last: u32 },
+    /// The minus signs of a Clifford gate: negate the boxes `negs[first..last]`.
+    Negate { first: u32, last: u32 },
 }
 
 /// A compiled propagation of one observable.
@@ -65,22 +70,26 @@ pub(crate) struct Tape {
     pub(crate) n_boxes: u32,
     /// The observable: (box, starting value) for each of its Pauli words.
     pub(crate) init: Vec<(u32, f64)>,
-    /// The rotation steps, in the order they are applied (circuit order reversed).
+    /// The steps, in the order they are applied (circuit order reversed).
     pub(crate) steps: Vec<Step>,
-    /// The pairs `[a, b]` of all steps, one step after another (8 bytes each).
+    /// The pairs `[a, b]` of all rotation steps, one step after another (8 bytes each).
     pub(crate) pairs: Vec<[u32; 2]>,
+    /// The boxes of all negate steps, one step after another.
+    pub(crate) negs: Vec<u32>,
     /// The boxes added up at the end: the words with only I and Z.
     pub(crate) readout: Vec<u32>,
 }
 
 /// What `tape_debug` returns to Python: `n_boxes`, `init`, the steps as
-/// `(parameter index, first pair, last pair)`, the pairs, the readout, and
-/// the word of every box as `(x words, z words)`.
+/// `("rotate", parameter index, first pair, last pair)` or
+/// `("negate", -1, first, last)`, the pairs, the negated boxes, the readout,
+/// and the word of every box as `(x words, z words)`.
 pub(crate) type TapeDebug = (
     u32,
     Vec<(u32, f64)>,
-    Vec<(u32, u32, u32)>,
+    Vec<(&'static str, i64, u32, u32)>,
     Vec<(u32, u32)>,
+    Vec<u32>,
     Vec<u32>,
     Vec<(Vec<u64>, Vec<u64>)>,
 );
@@ -102,9 +111,10 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     let steps = tape
         .steps
         .iter()
-        .map(|s| match s.angle {
-            Angle::Param(p) => (p, s.first, s.last),
-            Angle::Fixed { .. } => unreachable!("A2 compiles trainable rotations only"),
+        .map(|s| match *s {
+            Step::Rotate { angle: Angle::Param(p), first, last } => ("rotate", p as i64, first, last),
+            Step::Rotate { angle: Angle::Fixed { .. }, .. } => unreachable!("fixed angles come in A7"),
+            Step::Negate { first, last } => ("negate", -1, first, last),
         })
         .collect();
     Ok((
@@ -112,6 +122,7 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
         tape.init,
         steps,
         tape.pairs.iter().map(|p| (p[0], p[1])).collect(),
+        tape.negs,
         tape.readout,
         words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect(),
     ))
@@ -176,7 +187,7 @@ impl TapeProgram {
         self.tape.n_boxes
     }
 
-    /// Number of rotation steps.
+    /// Number of steps (rotations and negations).
     #[getter]
     fn n_steps(&self) -> usize {
         self.tape.steps.len()
