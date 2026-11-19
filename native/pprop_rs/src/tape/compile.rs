@@ -173,6 +173,8 @@ pub(crate) fn compile<const NW: usize>(
         steps: Vec::new(),
         pairs: Vec::new(),
         negs: Vec::new(),
+        blocks: Vec::new(),
+        block_progs: Vec::new(),
         readout: Vec::new(),
     };
 

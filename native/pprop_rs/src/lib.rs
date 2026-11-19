@@ -165,7 +165,7 @@ fn compile_tapes(
     })
 }
 
-/// Test-only: the tape of one observable as plain lists (see `tape::tape_debug_impl`).
+/// Test-only: the tape of one observable as a dict (see `tape::TapeDebug`).
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
@@ -173,6 +173,7 @@ fn compile_tapes(
 ))]
 #[allow(clippy::too_many_arguments)]
 fn tape_debug(
+    py: Python<'_>,
     num_qubits: u32,
     gate_kind: Vec<u8>,
     gate_wire0: Vec<u32>,
@@ -183,13 +184,14 @@ fn tape_debug(
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
-) -> PyResult<tape::TapeDebug> {
+) -> PyResult<PyObject> {
     let nw = words_needed(num_qubits);
-    dispatch_nw!(
+    let debug = dispatch_nw!(
         nw, num_qubits, tape_debug_impl,
         (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
          k1, use_dead_qubit_pruner, use_xy_weight_pruner)
-    )
+    )?;
+    debug.into_dict(py)
 }
 
 #[pymodule]

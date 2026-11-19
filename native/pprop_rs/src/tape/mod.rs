@@ -35,6 +35,12 @@
 //! each word into exactly one other word, sometimes with a minus sign. The
 //! compiler renames the boxes (a box keeps its number, its word changes), and
 //! the minus signs become a `Negate` step listing the boxes to multiply by −1.
+//!
+//! A controlled rotation mixes groups of up to 4 words, whose members can
+//! have different Pauli weights. Such a gate is a `Block` step: each group is
+//! a `Block` of up to 4 boxes, mixed by the small matrix of its `BlockProg`.
+//! A member that does not exist (too heavy for k1, say) is `NONE`: it is read
+//! as 0 and not written.
 
 mod compile;
 mod eval;
@@ -61,6 +67,27 @@ pub(crate) enum Step {
     Rotate { angle: Angle, first: u32, last: u32 },
     /// The minus signs of a Clifford gate: negate the boxes `negs[first..last]`.
     Negate { first: u32, last: u32 },
+    /// Groups of up to 4 boxes, `blocks[first..last]`, each mixed by its
+    /// `BlockProg` at this step's angle (a controlled rotation).
+    #[allow(dead_code)] // compiled from A7c-2 on
+    Block { angle: Angle, first: u32, last: u32 },
+}
+
+/// A member of a block with no box: read as 0, not written.
+pub(crate) const NONE: u32 = u32::MAX;
+
+/// How the members of one kind of block mix: each entry
+/// `(out member, in member, coeff, n_sin, n_cos)` adds
+/// `coeff · sin^n_sin · cos^n_cos · old[in]` to `new[out]`.
+pub(crate) struct BlockProg {
+    pub(crate) size: u8,
+    pub(crate) entries: Vec<(u8, u8, f64, u8, u8)>,
+}
+
+/// A group of up to `size` boxes mixed together, `prog` its `BlockProg`.
+pub(crate) struct Block {
+    pub(crate) prog: u32,
+    pub(crate) members: [u32; 4],
 }
 
 /// A compiled propagation of one observable.
@@ -75,28 +102,72 @@ pub(crate) struct Tape {
     pub(crate) pairs: Vec<[u32; 2]>,
     /// The boxes of all negate steps, one step after another.
     pub(crate) negs: Vec<u32>,
+    /// The blocks of all block steps, one step after another (20 bytes each).
+    pub(crate) blocks: Vec<Block>,
+    /// The kinds of block the blocks refer to (a handful per gate kind).
+    pub(crate) block_progs: Vec<BlockProg>,
     /// The boxes added up at the end: the words with only I and Z.
     pub(crate) readout: Vec<u32>,
 }
 
-/// What `tape_debug` returns to Python: `n_boxes`, `init`, the steps as
-/// `("rotate", parameter index, first pair, last pair)`,
-/// `("fixed", -1, first pair, last pair)` or `("negate", -1, first, last)`, the pairs, the negated boxes, the readout,
-/// the word of every box as `(x words, z words)`, and whether each box is
-/// still alive at the end (false once dropped by k1).
-pub(crate) type TapeDebug = (
-    u32,
-    Vec<(u32, f64)>,
-    Vec<(&'static str, i64, u32, u32)>,
-    Vec<(u32, u32)>,
-    Vec<u32>,
-    Vec<u32>,
-    Vec<(Vec<u64>, Vec<u64>)>,
-    Vec<bool>,
-);
+/// What `tape_debug` returns: the tape and, per box, its word and whether it
+/// is still alive at the end (false once dropped). Handed to Python as a
+/// dict, so new fields never break existing callers.
+pub(crate) struct TapeDebug {
+    tape: Tape,
+    words: Vec<(Vec<u64>, Vec<u64>)>,
+    alive: Vec<bool>,
+}
 
-/// Test-only: compile one observable and return the tape as plain lists, so
-/// tests can check the compiler before the tape can be evaluated.
+impl TapeDebug {
+    /// The dict: `n_boxes`, `init`, `steps` (`("rotate", parameter, first,
+    /// last)`, `("fixed", -1, ...)`, `("negate", -1, ...)`, `("block",
+    /// parameter, ...)` or `("block_fixed", -1, ...)`), `pairs`, `negs`,
+    /// `blocks` (`(prog, members)` with -1 for `NONE`), `block_progs`
+    /// (`(size, entries)`), `readout`, `words` (`(x words, z words)`) and
+    /// `alive`.
+    pub(crate) fn into_dict(self, py: Python<'_>) -> PyResult<PyObject> {
+        use pyo3::types::PyDict;
+        let t = self.tape;
+        let steps: Vec<(&str, i64, u32, u32)> = t
+            .steps
+            .iter()
+            .map(|s| match *s {
+                Step::Rotate { angle: Angle::Param(p), first, last } => ("rotate", p as i64, first, last),
+                Step::Rotate { angle: Angle::Fixed { .. }, first, last } => ("fixed", -1, first, last),
+                Step::Negate { first, last } => ("negate", -1, first, last),
+                Step::Block { angle: Angle::Param(p), first, last } => ("block", p as i64, first, last),
+                Step::Block { angle: Angle::Fixed { .. }, first, last } => ("block_fixed", -1, first, last),
+            })
+            .collect();
+        let blocks: Vec<(u32, Vec<i64>)> = t
+            .blocks
+            .iter()
+            .map(|b| {
+                let size = t.block_progs[b.prog as usize].size as usize;
+                let members = b.members[..size].iter().map(|&m| if m == NONE { -1 } else { m as i64 }).collect();
+                (b.prog, members)
+            })
+            .collect();
+        let progs: Vec<(u8, Vec<(u8, u8, f64, u8, u8)>)> =
+            t.block_progs.iter().map(|p| (p.size, p.entries.clone())).collect();
+        let d = PyDict::new_bound(py);
+        d.set_item("n_boxes", t.n_boxes)?;
+        d.set_item("init", t.init)?;
+        d.set_item("steps", steps)?;
+        d.set_item("pairs", t.pairs.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>())?;
+        d.set_item("negs", t.negs)?;
+        d.set_item("blocks", blocks)?;
+        d.set_item("block_progs", progs)?;
+        d.set_item("readout", t.readout)?;
+        d.set_item("words", self.words)?;
+        d.set_item("alive", self.alive)?;
+        Ok(d.into_any().unbind())
+    }
+}
+
+/// Test-only: compile one observable and return the tape (see `TapeDebug`),
+/// so tests can look at what the compiler wrote.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tape_debug_impl<const NW: usize>(
     gate_kind: Vec<u8>,
@@ -113,25 +184,8 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     let obs = observable_from_spec::<NW>(observable)?;
     let (tape, words, alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner)
         .map_err(PyValueError::new_err)?;
-    let steps = tape
-        .steps
-        .iter()
-        .map(|s| match *s {
-            Step::Rotate { angle: Angle::Param(p), first, last } => ("rotate", p as i64, first, last),
-            Step::Rotate { angle: Angle::Fixed { .. }, first, last } => ("fixed", -1, first, last),
-            Step::Negate { first, last } => ("negate", -1, first, last),
-        })
-        .collect();
-    Ok((
-        tape.n_boxes,
-        tape.init,
-        steps,
-        tape.pairs.iter().map(|p| (p[0], p[1])).collect(),
-        tape.negs,
-        tape.readout,
-        words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect(),
-        alive,
-    ))
+    let words = words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect();
+    Ok(TapeDebug { tape, words, alive })
 }
 
 /// The gates from the arrays Python passes, in circuit order.

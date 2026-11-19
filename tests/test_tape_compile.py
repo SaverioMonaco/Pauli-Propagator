@@ -30,7 +30,7 @@ def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False):
         return [sum(1 << q for q, ch in enumerate(word) if ch in letters)]
     wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     obs = [(bits(w, "XY"), bits(w, "ZY"), c, [], []) for w, c in observable]
-    n_boxes, init, steps, pairs, negs, readout, words, alive = pprop_rs.tape_debug(
+    d = pprop_rs.tape_debug(
         n,
         [_GATE_KIND[g] for g, _, _ in gates],
         [w0 for w0, _ in wires],
@@ -42,8 +42,8 @@ def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False):
         dead,
         xy,
     )
-    return dict(n_boxes=n_boxes, init=init, steps=steps, pairs=pairs, negs=negs, readout=readout,
-                words=[word_str(x, z, n) for x, z in words], alive=alive)
+    d["words"] = [word_str(x, z, n) for x, z in d["words"]]
+    return d
 
 
 def test_example_by_hand():
@@ -189,19 +189,27 @@ def test_xy_weight_pruner():
 def test_fixed_angle_step():
     # A fixed RX(0.3): the same pair as a trainable one, in a "fixed" step.
     out = pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [-1], [0.3], [([0], [1], 1.0, [], [])])
-    steps, pairs = out[2], out[3]
+    steps, pairs = out["steps"], out["pairs"]
     assert steps == [("fixed", -1, 0, 1)] and pairs == [(0, 1)]
+
+
+def test_debug_fields():
+    # tape_debug returns a dict; blocks stay empty until a gate compiles to them.
+    d = pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [0], [None], [([0], [1], 1.0, [], [])])
+    assert set(d) == {"n_boxes", "init", "steps", "pairs", "negs", "blocks", "block_progs",
+                      "readout", "words", "alive"}
+    assert d["blocks"] == [] and d["block_progs"] == []
 
 
 def test_t_gate_is_a_fixed_rz_pair():
     # T: X -> X/√2 − Y/√2, so the pair is [Y, X] as for RZ, in a fixed step.
     out = pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([1], [0], 1.0, [], [])])
-    steps, pairs, words = out[2], out[3], out[6]
+    steps, pairs, words = out["steps"], out["pairs"], out["words"]
     assert steps == [("fixed", -1, 0, 1)]
     assert [word_str(x, z, 1) for x, z in words] == ["X", "Y"] and pairs == [(1, 0)]
     # T commutes with Z: no step.
     out = pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([0], [1], 1.0, [], [])])
-    assert out[2] == []
+    assert out["steps"] == []
 
 
 def test_gates_not_supported_yet():
