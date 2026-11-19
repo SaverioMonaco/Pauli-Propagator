@@ -695,6 +695,21 @@ fn insert_or_extend<const NW: usize>(
     }
 }
 
+/// Sum a word's terms into one, for a propagation in which every term is a
+/// plain number (`mono == ROOT`). The terms are summed in order of value, so
+/// the result does not depend on the order they were appended in, which
+/// changes with the number of threads. Returns `false` when the sum is
+/// exactly zero and the word should be dropped.
+fn sum_scalar_terms(terms: &mut Vec<Term>) -> bool {
+    if terms.len() > 1 {
+        terms.sort_unstable_by(|a, b| a.coeff.total_cmp(&b.coeff));
+        let sum: f64 = terms.iter().map(|t| t.coeff).sum();
+        terms.truncate(1);
+        terms[0].coeff = sum;
+    }
+    terms.first().is_some_and(|t| t.coeff != 0.0)
+}
+
 // ---------------------------------------------------------------------
 // Rule tables (transcribed from pprop/gates/*.py)
 // ---------------------------------------------------------------------
