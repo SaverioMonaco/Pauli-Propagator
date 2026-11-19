@@ -671,16 +671,18 @@ fn mask_is_zero<const NW: usize>(a: &[u64; NW]) -> bool {
 }
 
 /// Merge `terms` into `key`'s coefficient. A new word takes ownership of the
-/// vector as-is; only a word that already exists pays for a copy.
+/// vector as-is; only a word that already exists pays for a copy. Returns
+/// whether the word already existed.
 fn insert_or_extend<const NW: usize>(
     map: &mut FxHashMap<PauliKey<NW>, Vec<Term>>,
     key: PauliKey<NW>,
     mut terms: Vec<Term>,
-) {
+) -> bool {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
         Entry::Vacant(slot) => {
             slot.insert(terms);
+            false
         }
         Entry::Occupied(mut slot) => {
             let existing = slot.get_mut();
@@ -688,6 +690,7 @@ fn insert_or_extend<const NW: usize>(
                 std::mem::swap(existing, &mut terms);
             }
             existing.append(&mut terms);
+            true
         }
     }
 }
