@@ -130,11 +130,15 @@ fn clifford_image<const NW: usize>(gate: &GateSpec<NW>, word: PauliKey<NW>) -> O
 
 /// The rule table of a one-qubit rotation, or `None` for a gate the tape
 /// cannot compile yet.
+///
+/// T is a rotation too: its rule (`t_rule`) is X -> X/√2 − Y/√2 and
+/// Y -> Y/√2 + X/√2, which is RZ's pairing of X and Y with cos = sin = 1/√2.
+/// So it uses RZ's table to find and order its pairs, and a fixed angle.
 fn rotation_rule(kind: u8) -> Option<fn(u8) -> Option<(u8, i8)>> {
     match kind {
         RX => Some(rx_rule),
         RY => Some(ry_rule),
-        RZ => Some(rz_rule),
+        RZ | T => Some(rz_rule),
         _ => None,
     }
 }
@@ -255,7 +259,11 @@ fn rotation_step<const NW: usize>(
     // A trainable angle is read at evaluation time; a fixed one is turned into
     // its cos and sin now, with the same snapping to exact zeros at quarter
     // turns as the sum-of-terms engine (`fixed_sin_cos`).
-    let angle = if gate.param >= 0 {
+    let angle = if gate.kind == T {
+        // The same constant as `t_rule`, not sin(π/4), which differs from it
+        // in the last digit.
+        Angle::Fixed { cos: std::f64::consts::FRAC_1_SQRT_2, sin: std::f64::consts::FRAC_1_SQRT_2 }
+    } else if gate.param >= 0 {
         Angle::Param(gate.param as u32)
     } else if let Some(theta) = gate.fixed {
         let (sin, cos) = fixed_sin_cos(theta);

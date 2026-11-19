@@ -2,7 +2,7 @@
 statevectors and against the sum-of-terms engine.
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
-or fixed angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
+or fixed angles, T, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
 truncation (checked against the sum-of-terms engine: a statevector cannot
 truncate) and the two exact pruners.
 """
@@ -321,6 +321,39 @@ def test_all_fixed_circuit():
     (program,) = tapes(2, gates, [observable])
     empty = np.zeros(0)
     assert program.eval(empty, empty) == pytest.approx(statevector(2, gates, observable, empty), abs=1e-12)
+
+
+@pytest.mark.parametrize("word", ["X", "Y", "Z"])
+def test_t_gate_on_each_word(word):
+    gates = [("RX", 0), ("RY", 0), ("T", 0), ("RX", 0), ("RY", 0)]
+    theta = np.random.default_rng(2).uniform(-np.pi, np.pi, 4)
+    (program,) = tapes(1, gates, [[(word, 1.0)]])
+    assert tape_value(program, theta) == pytest.approx(statevector(1, gates, [(word, 1.0)], theta), abs=1e-12)
+
+
+def random_t_case(seed):
+    """A random mixed circuit with T gates put in at random places."""
+    n, gates, observable, theta = random_case(seed)
+    rng = random.Random(2000 + seed)
+    out = []
+    for gate in gates:
+        if rng.random() < 0.3:
+            out.append(("T", rng.randrange(n)))
+        out.append(gate)
+    return n, out, observable, theta
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_t_gates_match_statevector_and_old_engine(seed):
+    n, gates, observable, theta = random_t_case(seed)
+    (program,) = tapes(n, gates, [observable])
+    value = tape_value(program, theta)
+    assert value == pytest.approx(statevector(n, gates, observable, theta), abs=1e-12)
+    assert value == pytest.approx(old_engine(gates, observable, theta), abs=1e-12)
+    k1 = random.Random(seed).randint(1, n)
+    (program,) = tapes(n, gates, [observable], k1=k1, dead=True, xy=True)
+    assert tape_value(program, theta) == pytest.approx(
+        old_engine(gates, observable, theta, k1=k1, dead=True, xy=True), abs=1e-12)
 
 
 def test_several_observables_and_several_thetas():

@@ -193,6 +193,17 @@ def test_fixed_angle_step():
     assert steps == [("fixed", -1, 0, 1)] and pairs == [(0, 1)]
 
 
+def test_t_gate_is_a_fixed_rz_pair():
+    # T: X -> X/√2 − Y/√2, so the pair is [Y, X] as for RZ, in a fixed step.
+    out = pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([1], [0], 1.0, [], [])])
+    steps, pairs, words = out[2], out[3], out[6]
+    assert steps == [("fixed", -1, 0, 1)]
+    assert [word_str(x, z, 1) for x, z in words] == ["X", "Y"] and pairs == [(1, 0)]
+    # T commutes with Z: no step.
+    out = pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([0], [1], 1.0, [], [])])
+    assert out[2] == []
+
+
 def test_gates_not_supported_yet():
     with pytest.raises(ValueError, match="cannot compile gate kind"):
-        pprop_rs.tape_debug(1, [_GATE_KIND["T"]], [0], [-1], [-1], [None], [([0], [1], 1.0, [], [])])
+        pprop_rs.tape_debug(2, [_GATE_KIND["CRX"]], [0], [1], [0], [None], [([0], [2], 1.0, [], [])])
