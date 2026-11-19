@@ -44,12 +44,14 @@
 
 mod compile;
 mod eval;
+mod grad;
 
 pub(crate) use compile::*;
 
 use crate::gates::GateSpec;
 use crate::pauli::*;
 use crate::pybuf::read_f64;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -238,6 +240,32 @@ impl TapeProgram {
                 "sins and coss need at least {} entries", self.n_params)));
         }
         Ok(py.allow_threads(|| self.tape.value(&sins, &coss)))
+    }
+
+    /// Expectation value, writing its gradient into `out` (a writable float64
+    /// array as long as `sins`). For a controlled rotation the gradient is in
+    /// the parameter as passed, θ/2, as in the sum-of-terms engine.
+    fn eval_and_grad(
+        &self,
+        py: Python<'_>,
+        sins: &Bound<'_, PyAny>,
+        coss: &Bound<'_, PyAny>,
+        out: &Bound<'_, PyAny>,
+    ) -> PyResult<f64> {
+        let sins = read_f64(sins)?;
+        let coss = read_f64(coss)?;
+        if sins.len() < self.n_params || coss.len() < self.n_params {
+            return Err(PyValueError::new_err(format!(
+                "sins and coss need at least {} entries", self.n_params)));
+        }
+        let buffer = PyBuffer::<f64>::get_bound(out)?;
+        if buffer.item_count() != sins.len() || buffer.readonly() {
+            return Err(PyValueError::new_err("out must be a writable float64 array as long as sins"));
+        }
+        let mut grad = vec![0.0f64; sins.len()];
+        let value = py.allow_threads(|| self.tape.value_and_grad(&sins, &coss, &mut grad));
+        buffer.copy_from_slice(py, &grad)?;
+        Ok(value)
     }
 
     /// Number of boxes (Pauli words) an evaluation works on.
