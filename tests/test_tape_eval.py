@@ -284,7 +284,17 @@ def test_pruners_on_brickwork():
     theta = np.random.default_rng(5).uniform(-np.pi, np.pi, 2 * n * L)
     (pruned,) = tapes(n, gates, [[(word, 1.0)]], k1=4, dead=True, xy=True)
     (full,) = tapes(n, gates, [[(word, 1.0)]], k1=4)
-    assert pruned.n_pairs < full.n_pairs                                         # it prunes something
+    # A pruned word never reaches the readout, so the cleanup at the end of
+    # compiling removes it anyway: the final tapes can be equal. The pruners
+    # save work while compiling, visible in the tape before cleanup.
+    assert pruned.n_pairs <= full.n_pairs
+    raw = lambda **kw: len(pprop_rs.tape_debug(
+        n, [_GATE_KIND[g] for g, *_ in gates],
+        [w[0] if isinstance(w, tuple) else w for _, w, *_ in gates],
+        [w[1] if isinstance(w, tuple) else -1 for _, w, *_ in gates],
+        [p for _, _, p, _ in with_params(gates)[0]], [None] * len(gates),
+        obs_spec([(word, 1.0)]), 4, **kw)["pairs"])
+    assert raw(use_dead_qubit_pruner=True, use_xy_weight_pruner=True) < raw()
     assert tape_value(pruned, theta) == pytest.approx(tape_value(full, theta), abs=1e-12)
     assert tape_value(pruned, theta) == pytest.approx(
         old_engine(gates, word, theta, k1=4, dead=True, xy=True), abs=1e-12)

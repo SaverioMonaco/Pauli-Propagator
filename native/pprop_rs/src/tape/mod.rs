@@ -42,6 +42,7 @@
 //! A member that does not exist (too heavy for k1, say) is `NONE`: it is read
 //! as 0 and not written.
 
+mod cleanup;
 mod compile;
 mod eval;
 mod grad;
@@ -57,6 +58,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// The angle of one rotation step.
+#[derive(Clone)]
 pub(crate) enum Angle {
     /// A trainable parameter: its index in the parameter vector.
     Param(u32),
@@ -89,6 +91,7 @@ pub(crate) struct BlockProg {
 }
 
 /// A group of up to `size` boxes mixed together, `prog` its `BlockProg`.
+#[derive(Clone)]
 pub(crate) struct Block {
     pub(crate) prog: u32,
     pub(crate) members: [u32; 4],
@@ -224,11 +227,26 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     k2: i64,
     sine_order: bool,
     coeff_threshold: f64,
+    cleanup: bool,
 ) -> PyResult<TapeDebug> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let obs = observable_from_spec::<NW>(observable)?;
-    let (tape, words, alive, bounds) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
-        .map_err(PyValueError::new_err)?;
+    let (mut tape, mut words, mut alive, mut bounds) =
+        compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
+            .map_err(PyValueError::new_err)?;
+    if cleanup {
+        // Keep the per-box lists in step with the new box numbers.
+        let renumber = tape.cleanup();
+        let mut old_of = vec![0usize; tape.n_boxes as usize]; // new box -> old box
+        for (old, &new) in renumber.iter().enumerate() {
+            if new != NONE {
+                old_of[new as usize] = old;
+            }
+        }
+        words = old_of.iter().map(|&o| words[o]).collect();
+        alive = old_of.iter().map(|&o| alive[o]).collect();
+        bounds = old_of.iter().map(|&o| bounds[o]).collect();
+    }
     let words = words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect();
     Ok(TapeDebug { tape, words, alive, bounds })
 }
@@ -369,8 +387,9 @@ pub(crate) fn compile_tapes_impl<const NW: usize>(
     let mut programs = Vec::with_capacity(paulidicts.len());
     for spec in paulidicts {
         let obs = observable_from_spec::<NW>(spec)?;
-        let (tape, ..) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
+        let (mut tape, ..) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
             .map_err(PyValueError::new_err)?;
+        tape.cleanup();
         let n_params = tape.n_params();
         programs.push(TapeProgram { tape, n_params });
     }

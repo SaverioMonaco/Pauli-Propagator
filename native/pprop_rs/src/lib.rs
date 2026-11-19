@@ -177,7 +177,7 @@ fn compile_tapes(
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
     k1 = -1, use_dead_qubit_pruner = false, use_xy_weight_pruner = false,
-    k2 = -1, sine_order = false, coeff_threshold = -1.0,
+    k2 = -1, sine_order = false, coeff_threshold = -1.0, cleanup = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn tape_debug(
@@ -195,12 +195,13 @@ fn tape_debug(
     k2: i64,
     sine_order: bool,
     coeff_threshold: f64,
+    cleanup: bool,
 ) -> PyResult<PyObject> {
     let nw = words_needed(num_qubits);
     let debug = dispatch_nw!(
         nw, num_qubits, tape_debug_impl,
         (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
-         k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold)
+         k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order, coeff_threshold, cleanup)
     )?;
     debug.into_dict(py)
 }
