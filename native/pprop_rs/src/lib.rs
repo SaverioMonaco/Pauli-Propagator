@@ -24,6 +24,7 @@ use pyo3::prelude::*;
 mod gates;
 mod pauli;
 mod pruning;
+mod tape;
 mod terms;
 mod threads;
 use pauli::*;
