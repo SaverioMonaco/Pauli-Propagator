@@ -4,7 +4,7 @@ statevectors and against the sum-of-terms engine.
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
 angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
 truncation (checked against the sum-of-terms engine: a statevector cannot
-truncate).
+truncate) and the two exact pruners.
 """
 import itertools
 import random
@@ -43,7 +43,7 @@ def with_params(gates):
     return out, p
 
 
-def tapes(n, gates, observables, k1=-1):
+def tapes(n, gates, observables, k1=-1, dead=False, xy=False):
     gates, _ = with_params(gates)
     wires = [w if isinstance(w, tuple) else (w, -1) for _, w, _ in gates]
     return pprop_rs.compile_tapes(
@@ -55,6 +55,8 @@ def tapes(n, gates, observables, k1=-1):
         [None] * len(gates),
         [obs_spec(o) for o in observables],
         k1,
+        dead,
+        xy,
     )
 
 
@@ -87,7 +89,7 @@ def statevector(n, gates, observable, theta):
     return float(sum(c * v for (_, c), v in zip(observable, np.atleast_1d(f()))))
 
 
-def old_engine(gates, observable, theta, k1=None):
+def old_engine(gates, observable, theta, k1=None, dead=False, xy=False):
     """observable: a word string, or [(word string, coeff)]."""
     if isinstance(observable, str):
         observable = [(observable, 1.0)]
@@ -96,7 +98,7 @@ def old_engine(gates, observable, theta, k1=None):
         apply(gates, params)
         return [qml.expval(qml.dot([c for _, c in observable], [pauli_op(w) for w, _ in observable]))]
     prop = Propagator(ansatz, k1=k1)
-    prop.propagate(n_threads=1)
+    prop.propagate(n_threads=1, use_dead_qubit_pruner=dead, use_xy_weight_pruner=xy)
     return float(np.ravel(prop(theta))[0])
 
 
@@ -235,6 +237,40 @@ def test_k1_heavy_observable_words_match_old_engine():
         (program,) = tapes(n, gates, [observable], k1=1)
         assert tape_value(program, theta) == pytest.approx(
             old_engine(gates, observable, theta, k1=1), abs=1e-12), (gates, observable)
+
+
+PRUNERS = [(True, False), (False, True), (True, True)]
+
+
+@pytest.mark.parametrize("dead,xy", PRUNERS, ids=["dead", "xy", "both"])
+@pytest.mark.parametrize("seed", range(25))
+def test_pruners_match_old_engine_and_change_nothing(seed, dead, xy):
+    n, gates, observable, theta = random_case(seed)
+    k1 = random.Random(seed).choice([-1, 1, 2, n])
+    (pruned,) = tapes(n, gates, [observable], k1=k1, dead=dead, xy=xy)
+    (full,) = tapes(n, gates, [observable], k1=k1)
+    value = tape_value(pruned, theta)
+    assert value == pytest.approx(tape_value(full, theta), abs=1e-12)          # exact pruning
+    assert value == pytest.approx(
+        old_engine(gates, observable, theta, k1=None if k1 < 0 else k1, dead=dead, xy=xy), abs=1e-12)
+    assert pruned.n_boxes <= full.n_boxes and pruned.n_pairs <= full.n_pairs
+
+
+def test_pruners_on_brickwork():
+    n, L = 8, 4
+    gates = []
+    for layer in range(L):
+        for q in range(n):
+            gates += [("RX", q), ("RY", q)]
+        gates += [("CNOT", (q, q + 1)) for q in range(layer % 2, n - 1, 2)]
+    word = "I" * (n // 2) + "Z" + "I" * (n - n // 2 - 1)
+    theta = np.random.default_rng(5).uniform(-np.pi, np.pi, 2 * n * L)
+    (pruned,) = tapes(n, gates, [[(word, 1.0)]], k1=4, dead=True, xy=True)
+    (full,) = tapes(n, gates, [[(word, 1.0)]], k1=4)
+    assert pruned.n_pairs < full.n_pairs                                         # it prunes something
+    assert tape_value(pruned, theta) == pytest.approx(tape_value(full, theta), abs=1e-12)
+    assert tape_value(pruned, theta) == pytest.approx(
+        old_engine(gates, word, theta, k1=4, dead=True, xy=True), abs=1e-12)
 
 
 def test_several_observables_and_several_thetas():

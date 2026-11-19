@@ -107,10 +107,13 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     gate_fixed: Vec<Option<f64>>,
     observable: Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>,
     k1: i64,
+    use_dead_qubit_pruner: bool,
+    use_xy_weight_pruner: bool,
 ) -> PyResult<TapeDebug> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let obs = observable_from_spec::<NW>(observable)?;
-    let (tape, words, alive) = compile(&gates, &obs, k1).map_err(PyValueError::new_err)?;
+    let (tape, words, alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+        .map_err(PyValueError::new_err)?;
     let steps = tape
         .steps
         .iter()
@@ -213,12 +216,15 @@ pub(crate) fn compile_tapes_impl<const NW: usize>(
     gate_fixed: Vec<Option<f64>>,
     paulidicts: Vec<Vec<(Vec<u64>, Vec<u64>, f64, Vec<u32>, Vec<u32>)>>,
     k1: i64,
+    use_dead_qubit_pruner: bool,
+    use_xy_weight_pruner: bool,
 ) -> PyResult<Vec<TapeProgram>> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let mut programs = Vec::with_capacity(paulidicts.len());
     for spec in paulidicts {
         let obs = observable_from_spec::<NW>(spec)?;
-        let (tape, _words, _alive) = compile(&gates, &obs, k1).map_err(PyValueError::new_err)?;
+        let (tape, _words, _alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+            .map_err(PyValueError::new_err)?;
         let n_params = tape.n_params();
         programs.push(TapeProgram { tape, n_params });
     }

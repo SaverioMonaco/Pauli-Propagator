@@ -451,16 +451,11 @@ pub(crate) fn propagate_batch_impl<const NW: usize>(
     }
     // Heisenberg picture: consume gates in reverse circuit order.
     let reversed: Vec<GateSpec<NW>> = gates.into_iter().rev().collect();
-    let n = reversed.len();
     let gate_masks: Vec<[u64; NW]> = reversed.iter().map(|g| g.wire_mask).collect();
     let layers = build_layers(&gate_masks);
 
-    // Suffix union of wire masks: active_qubits_from[i] = qubits touched by
-    // gates i..n-1 (used by DeadQubitPruner).
-    let mut active_qubits_from = vec![[0u64; NW]; n + 1];
-    for i in (0..n).rev() {
-        active_qubits_from[i] = mask_or(&active_qubits_from[i + 1], &reversed[i].wire_mask);
-    }
+    // active_qubits_from[i] = qubits touched by gates i..n-1 (DeadQubitPruner).
+    let active_qubits_from = dead_qubit_masks(&gate_masks);
 
     let circuit = Circuit {
         reversed: &reversed,

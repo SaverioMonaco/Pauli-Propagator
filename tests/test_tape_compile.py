@@ -2,7 +2,7 @@
 
 So far the tape compiles one-qubit rotations (RX, RY, RZ) with trainable
 angles, and the Clifford gates (H, S, SX, CNOT, CY, CZ, SWAP), with the k1
-truncation.
+truncation and the two exact pruners.
 """
 import random
 
@@ -21,7 +21,7 @@ def word_str(x, z, n):
     return "".join(LETTERS[((x[0] >> q) & 1, (z[0] >> q) & 1)] for q in range(n))
 
 
-def compile_tape(n, gates, observable, k1=-1):
+def compile_tape(n, gates, observable, k1=-1, dead=False, xy=False):
     """gates: [(name, wires, param index)] in circuit order; wires is a qubit or
     a (control, target) pair; param is -1 for a Clifford gate.
     observable: [(word string, coefficient)].
@@ -39,6 +39,8 @@ def compile_tape(n, gates, observable, k1=-1):
         [None] * len(gates),
         obs,
         k1,
+        dead,
+        xy,
     )
     return dict(n_boxes=n_boxes, init=init, steps=steps, pairs=pairs, negs=negs, readout=readout,
                 words=[word_str(x, z, n) for x, z in words], alive=alive)
@@ -160,6 +162,28 @@ def test_observable_cut_after_its_first_gate():
     # No gate touches the observable: nothing is cut.
     t = compile_tape(3, [("RX", 2, 0)], [("ZZI", 1.0)], k1=1)
     assert t["alive"] == [True] and t["readout"] == [0]
+
+
+def test_dead_qubit_pruner():
+    # RX(θ0) q0, RX(θ1) q1, <ZZ>. Backwards: RX(θ1) pairs ZZ with ZY. Then
+    # only RX(θ0) on q0 is left: ZY has a Y on q1, which no remaining gate
+    # touches, so it can never reach the readout and is dropped before the gate.
+    gates = [("RX", 0, 0), ("RX", 1, 1)]
+    t = compile_tape(2, gates, [("ZZ", 1.0)], dead=True)
+    assert t["words"] == ["ZZ", "ZY", "YZ"] and t["alive"] == [True, False, True]
+    assert t["pairs"] == [(0, 1), (0, 2)]
+    # Without the pruner ZY is paired with YY too.
+    t = compile_tape(2, gates, [("ZZ", 1.0)])
+    assert t["words"] == ["ZZ", "ZY", "YZ", "YY"] and t["pairs"] == [(0, 1), (0, 2), (1, 3)]
+
+
+def test_xy_weight_pruner():
+    # <YY> through one gate on q0: a gate removes at most one X/Y, and YY has
+    # two, so it is dropped before RX(θ0) acts on it.
+    t = compile_tape(2, [("RX", 0, 0)], [("YY", 1.0)], xy=True)
+    assert t["alive"] == [False] and t["steps"] == [] and t["readout"] == []
+    t = compile_tape(2, [("RX", 0, 0)], [("YY", 1.0)])
+    assert t["words"] == ["YY", "ZY"] and t["steps"] == [("rotate", 0, 0, 1)]
 
 
 def test_gates_not_supported_yet():

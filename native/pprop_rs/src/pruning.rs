@@ -23,3 +23,16 @@ pub(crate) fn xy_reachable<const NW: usize>(x: &[u64; NW], gate_masks: &[[u64; N
     }
     false
 }
+
+/// For the DeadQubitPruner: `masks[i]` = the qubits touched by gates
+/// `i..n-1` of `gate_masks` (the gates in propagation order, i.e. the circuit
+/// reversed), with `masks[n]` empty. A word with X/Y on a qubit outside
+/// `masks[i]` can never lose it once gate `i` is reached.
+pub(crate) fn dead_qubit_masks<const NW: usize>(gate_masks: &[[u64; NW]]) -> Vec<[u64; NW]> {
+    let n = gate_masks.len();
+    let mut masks = vec![[0u64; NW]; n + 1];
+    for i in (0..n).rev() {
+        masks[i] = mask_or(&masks[i + 1], &gate_masks[i]);
+    }
+    masks
+}

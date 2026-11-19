@@ -13,10 +13,15 @@
 //! word's weight (it swaps two non-identity letters on its qubit), so only a
 //! Clifford gate can make a word too heavy; its box is dropped (it leaves the
 //! word table, and its value is never read again).
+//!
+//! The two exact pruners (dead qubit, XY weight) drop a word that can never
+//! reach the readout. As in the sum-of-terms engine, a word is checked just
+//! before a gate that changes it, against the gates from that one on.
 
 use super::{Angle, Step, Tape};
 use crate::gates::*;
 use crate::pauli::*;
+use crate::pruning::*;
 use rustc_hash::FxHashMap;
 
 /// Every word met so far, and its box.
@@ -139,13 +144,24 @@ fn rotation_rule(kind: u8) -> Option<fn(u8) -> Option<(u8, i8)>> {
 pub(crate) type Compiled<const NW: usize> = (Tape, Vec<PauliKey<NW>>, Vec<bool>);
 
 /// Compile one observable through `gates` (in circuit order), dropping every
-/// word of weight above `k1` (`k1 < 0`: no limit).
+/// word of weight above `k1` (`k1 < 0`: no limit) and, if asked, the words
+/// the exact pruners find dead.
 pub(crate) fn compile<const NW: usize>(
     gates: &[GateSpec<NW>],
     observable: &[(PauliKey<NW>, f64)],
     k1: i64,
+    use_dead_qubit_pruner: bool,
+    use_xy_weight_pruner: bool,
 ) -> Result<Compiled<NW>, String> {
     let too_heavy = |w: &PauliKey<NW>| k1 >= 0 && combined_weight(&w.0, &w.1) > k1 as u32;
+    // The gates in propagation order, and what the pruners need of them.
+    let gate_masks: Vec<[u64; NW]> = gates.iter().rev().map(|g| g.wire_mask).collect();
+    let active_from = dead_qubit_masks(&gate_masks);
+    // Can a word reach the readout, seen just before gate `i` (propagation order)?
+    let pruned = |w: &PauliKey<NW>, i: usize| {
+        (use_dead_qubit_pruner && !mask_subset(&w.0, &active_from[i]))
+            || (use_xy_weight_pruner && !xy_reachable(&w.0, &gate_masks[i..]))
+    };
     let mut boxes = Boxes::<NW>::new();
     let mut tape = Tape {
         n_boxes: 0,
@@ -174,7 +190,8 @@ pub(crate) fn compile<const NW: usize>(
     }
     let mut observable_cut = false;
 
-    for gate in gates.iter().rev() {
+    for (i, gate) in gates.iter().rev().enumerate() {
+        let pruned_here = |w: &PauliKey<NW>| pruned(w, i);
         if is_clifford(gate.kind) {
             // Rename every word the gate changes; remember the minus signs;
             // drop the words it makes too heavy.
@@ -186,7 +203,7 @@ pub(crate) fn compile<const NW: usize>(
                     continue;
                 }
                 if let Some((word, sign)) = clifford_image(gate, boxes.words[b]) {
-                    if too_heavy(&word) {
+                    if pruned_here(&boxes.words[b]) || too_heavy(&word) {
                         drops.push(b);
                         continue;
                     }
@@ -204,7 +221,7 @@ pub(crate) fn compile<const NW: usize>(
                 tape.steps.push(Step::Negate { first, last });
             }
         } else {
-            rotation_step(gate, &mut boxes, &mut tape, &too_heavy)?;
+            rotation_step(gate, &mut boxes, &mut tape, &too_heavy, &pruned_here)?;
         }
 
         if !observable_cut && mask_intersects(&gate.wire_mask, &obs_support) {
@@ -225,11 +242,13 @@ pub(crate) fn compile<const NW: usize>(
 }
 
 /// One rotation gate: pair every word it changes with the word it turns into.
+/// A word the pruners reject is dropped instead.
 fn rotation_step<const NW: usize>(
     gate: &GateSpec<NW>,
     boxes: &mut Boxes<NW>,
     tape: &mut Tape,
     too_heavy: &impl Fn(&PauliKey<NW>) -> bool,
+    pruned: &impl Fn(&PauliKey<NW>) -> bool,
 ) -> Result<(), String> {
     let rule = rotation_rule(gate.kind)
         .ok_or_else(|| format!("the tape cannot compile gate kind {} yet", gate.kind))?;
@@ -257,6 +276,14 @@ fn rotation_step<const NW: usize>(
         let Some((out, sign)) = rule(pauli_label(&x, &z, gate.wire0)) else {
             continue; // the gate commutes with this word
         };
+        if pruned(&boxes.words[b]) {
+            boxes.drop_box(b);
+            continue;
+        }
+        // An existing partner is not checked: if the pruners reject it, its
+        // whole future, including what it gives this word here, adds 0 to the
+        // readout (they are exact), so keeping its box changes no value and
+        // saves making a fresh one.
         let partner = boxes.get_or_new(set_label(x, z, gate.wire0, out));
         // `word -> cos·word + sign·sin·partner`: with sign +1 the word is
         // `a`; with sign -1 the partner is (the rule is antisymmetric).
