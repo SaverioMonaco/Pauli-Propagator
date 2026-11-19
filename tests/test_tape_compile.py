@@ -196,8 +196,10 @@ def test_fixed_angle_step():
 def test_debug_fields():
     # tape_debug returns a dict; blocks stay empty until a gate compiles to them.
     d = pprop_rs.tape_debug(1, [_GATE_KIND["RX"]], [0], [-1], [0], [None], [([0], [1], 1.0, [], [])])
-    assert set(d) == {"n_boxes", "init", "steps", "pairs", "negs", "blocks", "block_progs",
-                      "readout", "words", "alive"}
+    # New fields may be added over time; these are the ones tests rely on.
+    assert {"n_boxes", "init", "steps", "pairs", "negs", "blocks", "block_progs",
+            "readout", "words", "alive", "k2", "sine_order"} <= set(d)
+    assert d["k2"] == -1 and d["sine_order"] is False
     assert d["blocks"] == [] and d["block_progs"] == []
 
 

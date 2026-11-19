@@ -1,5 +1,5 @@
 """Propagator's default engine is the tape; the sum-of-terms engine is kept
-for exprs/expression() and for k2 and coeff_threshold."""
+for exprs/expression() and for coeff_threshold."""
 import numpy as np
 import pennylane as qml
 import pytest
@@ -45,12 +45,12 @@ def test_expression_works_with_the_tape():
 
 
 @pytest.mark.parametrize("kw", [dict(k2=2), dict(k2=1, k2_mode="sine")])
-def test_k2_falls_back_to_the_old_engine(kw):
+def test_k2_uses_the_tape(kw):
     p = Propagator(ansatz, **kw)
     p.propagate()
-    assert p.engine == "terms" and p.programs is None
-    f, g = make_sparse_evaluator(p.exprs[0], p.num_params)
-    assert p(THETA)[0] == pytest.approx(f(np.sin(THETA), np.cos(THETA)), abs=1e-15)
+    assert p.engine == "tape" and p.programs[0].k2 == kw["k2"]
+    f, _ = make_sparse_evaluator(p.exprs[0], p.num_params)
+    assert p(THETA)[0] == pytest.approx(f(np.sin(THETA), np.cos(THETA)), abs=1e-12)
 
 
 def test_coeff_threshold_falls_back_to_the_old_engine():

@@ -59,6 +59,9 @@ impl Tape {
     /// gradient, written into `grad` (zeroed first; as long as the parameter
     /// vector).
     pub(crate) fn value_and_grad(&self, sins: &[f64], coss: &[f64], grad: &mut [f64]) -> f64 {
+        if self.k2 >= 0 {
+            return self.value_and_grad_orders(sins, coss, grad);
+        }
         grad.iter_mut().for_each(|g| *g = 0.0);
         let mut v = vec![0.0f64; self.n_boxes as usize];
         for &(b, c) in &self.init {
@@ -228,6 +231,8 @@ mod tests {
             blocks: vec![Block { prog: 0, members: [0, 1, 2, 3] }, Block { prog: 1, members: [3, NONE, NONE, NONE] }],
             block_progs: vec![quad, pair],
             readout: vec![0, 3],
+            k2: -1,
+            sine_order: false,
         };
         let theta: [f64; 3] = [0.4, -1.3, 2.2];
         let s: Vec<f64> = theta.iter().map(|x| x.sin()).collect();

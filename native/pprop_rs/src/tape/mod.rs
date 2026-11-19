@@ -45,6 +45,7 @@
 mod compile;
 mod eval;
 mod grad;
+mod orders;
 
 pub(crate) use compile::*;
 
@@ -109,6 +110,18 @@ pub(crate) struct Tape {
     pub(crate) block_progs: Vec<BlockProg>,
     /// The boxes added up at the end: the words with only I and Z.
     pub(crate) readout: Vec<u32>,
+    /// The k2 truncation (-1: none). With k2, every box holds k2 + 1 numbers,
+    /// one per order (see `orders.rs`).
+    pub(crate) k2: i64,
+    /// Whether k2 counts only sin factors (sine mode) or sin and cos factors.
+    pub(crate) sine_order: bool,
+}
+
+impl Tape {
+    /// Numbers per box: k2 + 1 with the k2 truncation, else 1.
+    pub(crate) fn orders(&self) -> usize {
+        if self.k2 >= 0 { self.k2 as usize + 1 } else { 1 }
+    }
 }
 
 /// What `tape_debug` returns: the tape and, per box, its word and whether it
@@ -161,6 +174,8 @@ impl TapeDebug {
         d.set_item("blocks", blocks)?;
         d.set_item("block_progs", progs)?;
         d.set_item("readout", t.readout)?;
+        d.set_item("k2", t.k2)?;
+        d.set_item("sine_order", t.sine_order)?;
         d.set_item("words", self.words)?;
         d.set_item("alive", self.alive)?;
         Ok(d.into_any().unbind())
@@ -180,10 +195,12 @@ pub(crate) fn tape_debug_impl<const NW: usize>(
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
+    k2: i64,
+    sine_order: bool,
 ) -> PyResult<TapeDebug> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let obs = observable_from_spec::<NW>(observable)?;
-    let (tape, words, alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+    let (tape, words, alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
         .map_err(PyValueError::new_err)?;
     let words = words.iter().map(|(x, z)| (x.to_vec(), z.to_vec())).collect();
     Ok(TapeDebug { tape, words, alive })
@@ -280,6 +297,12 @@ impl TapeProgram {
         self.tape.steps.len()
     }
 
+    /// The k2 truncation (-1: none).
+    #[getter]
+    fn k2(&self) -> i64 {
+        self.tape.k2
+    }
+
     /// Number of pairs, over all steps (one 2x2 update each per evaluation).
     #[getter]
     fn n_pairs(&self) -> usize {
@@ -298,12 +321,14 @@ pub(crate) fn compile_tapes_impl<const NW: usize>(
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
+    k2: i64,
+    sine_order: bool,
 ) -> PyResult<Vec<TapeProgram>> {
     let gates = gates_from_arrays::<NW>(&gate_kind, &gate_wire0, &gate_wire1, &gate_param, &gate_fixed);
     let mut programs = Vec::with_capacity(paulidicts.len());
     for spec in paulidicts {
         let obs = observable_from_spec::<NW>(spec)?;
-        let (tape, _words, _alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+        let (tape, _words, _alive) = compile(&gates, &obs, k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
             .map_err(PyValueError::new_err)?;
         let n_params = tape.n_params();
         programs.push(TapeProgram { tape, n_params });

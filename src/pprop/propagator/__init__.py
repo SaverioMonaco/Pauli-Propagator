@@ -166,8 +166,8 @@ class Propagator:
         compiled tape per observable.
     engine : str or None
         Populated by :meth:`propagate`: ``"tape"`` (the default), or
-        ``"terms"`` (the sum-of-terms engine) when ``k2`` or
-        ``coeff_threshold`` is used, which the tape does not support yet.
+        ``"terms"`` (the sum-of-terms engine) when ``coeff_threshold`` is
+        used, which the tape does not support yet.
     _eval_list : list[Callable]
         Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> float`` for each observable, where ``sins`` and
@@ -297,7 +297,9 @@ class Propagator:
         the number of Pauli paths. :meth:`__call__` and :meth:`eval_and_grad`
         then run the tape for any parameters.
 
-        With ``k2`` (set on the propagator) or ``coeff_threshold``, which the
+        ``k1`` and ``k2`` (with either ``k2_mode``) truncate exactly as in the
+        sum-of-terms engine; with ``k2`` every box holds ``k2 + 1`` numbers,
+        one per number of sin/cos factors. With ``coeff_threshold``, which the
         tape does not support yet, the sum-of-terms engine is used instead:
         it builds :attr:`exprs` and compiles it into numeric evaluators (see
         ``evaluator.make_sparse_evaluator``). :attr:`engine` says which was
@@ -386,8 +388,8 @@ class Propagator:
         self._eval_list = []
         self._eval_and_grad_list = []
 
-        if self.k2 is not None or coeff_threshold is not None:
-            # No tape version of these truncations yet: the sum-of-terms engine.
+        if coeff_threshold is not None:
+            # No tape version of this truncation yet: the sum-of-terms engine.
             self.engine = "terms"
             self.programs = None
             for expr in self.exprs:
@@ -404,6 +406,8 @@ class Propagator:
                 self.k1 if self.k1 is not None else -1,
                 use_dead_qubit_pruner,
                 use_xy_weight_pruner,
+                self.k2 if self.k2 is not None else -1,
+                self.k2_mode == "sine",
             )
             for program in self.programs:
                 fg = _tape_evaluator(program, self.num_params)

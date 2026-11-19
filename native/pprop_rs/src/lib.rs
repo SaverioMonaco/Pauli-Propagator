@@ -135,11 +135,13 @@ fn evolve_single_gate_debug(
 
 /// Compile each observable into a `TapeProgram`, dropping words of Pauli
 /// weight above `k1` (-1: no limit) and, if asked, the words the exact pruners
-/// find dead.
+/// find dead; `k2` (-1: none) truncates the number of sin/cos factors (only
+/// sin with `sine_order`), as in the sum-of-terms engine.
 #[pyfunction]
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts,
     k1 = -1, use_dead_qubit_pruner = false, use_xy_weight_pruner = false,
+    k2 = -1, sine_order = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn compile_tapes(
@@ -154,13 +156,15 @@ fn compile_tapes(
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
+    k2: i64,
+    sine_order: bool,
 ) -> PyResult<Vec<TapeProgram>> {
     let nw = words_needed(num_qubits);
     py.allow_threads(move || {
         dispatch_nw!(
             nw, num_qubits, compile_tapes_impl,
             (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, paulidicts,
-             k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+             k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
         )
     })
 }
@@ -170,6 +174,7 @@ fn compile_tapes(
 #[pyo3(signature = (
     num_qubits, gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
     k1 = -1, use_dead_qubit_pruner = false, use_xy_weight_pruner = false,
+    k2 = -1, sine_order = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn tape_debug(
@@ -184,12 +189,14 @@ fn tape_debug(
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
+    k2: i64,
+    sine_order: bool,
 ) -> PyResult<PyObject> {
     let nw = words_needed(num_qubits);
     let debug = dispatch_nw!(
         nw, num_qubits, tape_debug_impl,
         (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed, observable,
-         k1, use_dead_qubit_pruner, use_xy_weight_pruner)
+         k1, use_dead_qubit_pruner, use_xy_weight_pruner, k2, sine_order)
     )?;
     debug.into_dict(py)
 }

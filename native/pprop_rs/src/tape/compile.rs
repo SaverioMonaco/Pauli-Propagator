@@ -157,13 +157,16 @@ pub(crate) type Compiled<const NW: usize> = (Tape, Vec<PauliKey<NW>>, Vec<bool>)
 
 /// Compile one observable through `gates` (in circuit order), dropping every
 /// word of weight above `k1` (`k1 < 0`: no limit) and, if asked, the words
-/// the exact pruners find dead.
+/// the exact pruners find dead. `k2` (`< 0`: none) and `sine_order` only set
+/// how the tape is evaluated (see `orders.rs`).
 pub(crate) fn compile<const NW: usize>(
     gates: &[GateSpec<NW>],
     observable: &[(PauliKey<NW>, f64)],
     k1: i64,
     use_dead_qubit_pruner: bool,
     use_xy_weight_pruner: bool,
+    k2: i64,
+    sine_order: bool,
 ) -> Result<Compiled<NW>, String> {
     let too_heavy = |w: &PauliKey<NW>| k1 >= 0 && combined_weight(&w.0, &w.1) > k1 as u32;
     // The gates in propagation order, and what the pruners need of them.
@@ -184,6 +187,8 @@ pub(crate) fn compile<const NW: usize>(
         blocks: Vec::new(),
         block_progs: Vec::new(),
         readout: Vec::new(),
+        k2,
+        sine_order,
     };
 
     // The observable's words are the first boxes. A word listed twice gets

@@ -12,6 +12,9 @@ impl Tape {
     /// block step mixes each block's members by its `BlockProg`; the blocks of
     /// one step share no box either.
     pub(crate) fn value(&self, sins: &[f64], coss: &[f64]) -> f64 {
+        if self.k2 >= 0 {
+            return self.value_orders(sins, coss);
+        }
         let mut v = vec![0.0f64; self.n_boxes as usize];
         for &(b, c) in &self.init {
             v[b as usize] = c;
@@ -100,7 +103,7 @@ mod tests {
 
     fn tape(n_boxes: u32, init: Vec<(u32, f64)>, steps: Vec<Step>, pairs: Vec<[u32; 2]>,
             blocks: Vec<Block>, block_progs: Vec<BlockProg>, readout: Vec<u32>) -> Tape {
-        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), blocks, block_progs, readout }
+        Tape { n_boxes, init, steps, pairs, negs: Vec::new(), blocks, block_progs, readout, k2: -1, sine_order: false }
     }
 
     /// A pair rotation written as a 2-member block: new a = c·a − s·b, new b = s·a + c·b.
