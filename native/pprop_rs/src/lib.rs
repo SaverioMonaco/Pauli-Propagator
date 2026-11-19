@@ -22,14 +22,17 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyByteArray;
-use rustc_hash::{FxHashMap, FxHasher};
-use std::hash::{Hash, Hasher};
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod gates;
 mod pauli;
+mod pruning;
+mod threads;
 use gates::*;
 use pauli::*;
+use pruning::*;
+use threads::*;
 
 // One trigonometric product term as Python sees it: (coeff, sin_indices,
 // cos_indices) means coeff * prod(sin(theta_i) for i in sin_indices) *
@@ -611,28 +614,6 @@ fn evolve_one_gate<const NW: usize>(
 // Heisenberg propagation loop
 // ---------------------------------------------------------------------
 
-/// XYWeightPruner verdict: can the gates in `gate_masks` (the rest of the
-/// circuit, in order) still reduce this word's XY-weight to zero? Each gate
-/// that touches the growing causal cone of `x` can remove at most one X/Y.
-fn xy_reachable<const NW: usize>(x: &[u64; NW], gate_masks: &[[u64; NW]]) -> bool {
-    let xy_weight = mask_popcount(x);
-    if xy_weight == 0 {
-        return true;
-    }
-    let mut xy_support = *x;
-    let mut budget = 0u32;
-    for gm in gate_masks {
-        if mask_intersects(gm, &xy_support) {
-            budget += 1;
-            mask_or_assign(&mut xy_support, gm);
-            if budget >= xy_weight {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Apply the k1/k2/coefficient truncations to one word; `false` means the
 /// word has nothing left and should be dropped.
 fn truncate<const NW: usize>(
@@ -712,18 +693,6 @@ struct LayerPass<'a, const NW: usize> {
 // Below this many words a layer runs on the calling thread; spawning
 // would cost more than it saves.
 const PARALLEL_MIN_WORDS: usize = 1 << 13;
-
-/// The shard (and so the thread) that owns `key`. The hash is remixed so
-/// the keys within one shard still spread over all of its map's buckets.
-fn shard_of<const NW: usize>(key: &PauliKey<NW>, n_shards: usize) -> usize {
-    if n_shards == 1 {
-        return 0;
-    }
-    let mut h = FxHasher::default();
-    key.hash(&mut h);
-    let mixed = h.finish().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
-    ((mixed * n_shards as u64) >> 32) as usize
-}
 
 /// First half of a layer, for one shard: move out the words the layer acts
 /// on, carry each through its gates in circuit order, and batch the results
@@ -833,25 +802,6 @@ fn merge_shard<const NW: usize>(
         }
     }
     active
-}
-
-/// `f` applied to every item, on one scoped thread per item when `parallel`,
-/// with the results in item order.
-fn run_all<T: Send, R: Send>(items: Vec<T>, parallel: bool, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    if !parallel {
-        return items.into_iter().map(f).collect();
-    }
-    let f = &f;
-    std::thread::scope(|s| {
-        let handles: Vec<_> = items
-            .into_iter()
-            .map(|item| s.spawn(move || f(item)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
-    })
 }
 
 /// Propagate one observable backwards through the circuit.
