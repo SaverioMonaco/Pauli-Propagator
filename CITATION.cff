@@ -9,7 +9,7 @@ authors:
 - family-names: "Muff"
   given-names: "Jake"
 title: "Pauli-Propagator"
-version: 3.4.0
+version: 4.0.0
 doi: 10.5281/zenodo.16028009
-date-released: 2026-10-26
+date-released: 2026-11-20
 url: "https://github.com/SaverioMonaco/Pauli-Propagator"
