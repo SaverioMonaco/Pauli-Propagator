@@ -1,15 +1,19 @@
-//! Rust implementation of pprop's Heisenberg propagation core.
+//! Rust implementation of pprop's Heisenberg propagation core. This file is
+//! only the Python interface; README.md maps the modules.
 //!
 //! It covers every gate in `pprop.gates` (RX/RY/RZ, H/S/SX/T, SWAP, CNOT/CY/CZ,
 //! CRX/CRY/CRZ), both exact pruners (`DeadQubitPruner`, `XYWeightPruner`), and
 //! all three truncations (`WeightTruncation`, `FrequencyTruncation`,
-//! `CoefficientTruncation`). The evolution rule tables below are transcribed
-//! 1:1 from the `rule` dicts in `pprop/gates/*.py`, which remain in the Python
-//! source as the human-readable reference these tables are checked against,
-//! entry-for-entry, by `tests/test_rule_tables.py` (via
-//! `evolve_single_gate_debug` below). `tests/test_backends.py` covers
-//! correctness at the full-circuit level instead (random circuits vs. PennyLane
-//! directly).
+//! `CoefficientTruncation`), with two engines: the tape (`tape/`, the default,
+//! used by `compile_tapes`) and the sum of terms (`terms/`, used by
+//! `propagate_batch` for `p.exprs`).
+//!
+//! The evolution rule tables in `gates.rs` are transcribed 1:1 from the `rule`
+//! dicts in `pprop/gates/*.py`, which remain in the Python source as the
+//! human-readable reference these tables are checked against, entry-for-entry,
+//! by `tests/test_rule_tables.py` (via `evolve_single_gate_debug` below).
+//! `tests/test_backends.py` covers correctness at the full-circuit level
+//! instead (random circuits vs. PennyLane directly).
 //!
 //! How a Pauli word is stored as bits is described in `pauli.rs`.
 

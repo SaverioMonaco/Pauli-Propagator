@@ -3,7 +3,7 @@
 
 use crate::pauli::*;
 
-// Gate kind codes, matching pprop.propagator.GATE_KIND in __init__.py.
+// Gate kind codes, matching _GATE_KIND in src/pprop/propagator/__init__.py.
 pub(crate) const RX: u8 = 0;
 pub(crate) const RY: u8 = 1;
 pub(crate) const RZ: u8 = 2;

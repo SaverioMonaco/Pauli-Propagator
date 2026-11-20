@@ -23,21 +23,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
 
+import pprop_rs
 from numpy import arange, array, asarray, cos, empty, float64, integer, ndarray, sin
 from pennylane import draw
 from pennylane.tape import QuantumTape
 
-import pprop_rs
-
 from .. import gates
 from ..pauli.sentence import PauliDict
 from .binding import BoundPropagator, Free, affine_from_exprs
-from .evaluator import make_sparse_evaluator
 from .utils import remove_duplicate_observables, requires_propagation
 
 #: Gate class name (pennylane's Operator.name) -> pprop_rs gate-kind code.
 #: Must stay in sync with the kind constants at the top of
-#: native/pprop_rs/src/lib.rs.
+#: native/pprop_rs/src/gates.rs.
 _GATE_KIND = {
     "RX": 0, "RY": 1, "RZ": 2,
     "Hadamard": 3, "S": 4, "SX": 5, "T": 6,
@@ -50,9 +48,9 @@ def _words_needed(num_qubits: int) -> int:
     """
     Smallest power-of-two count of 64-bit words covering ``num_qubits``.
 
-    Must match ``words_needed()`` in ``native/pprop_rs/src/lib.rs`` exactly -
-    it picks which of that file's const-generic ``NW`` monomorphizations
-    handles this circuit, and this function picks how many ``u64`` limbs
+    Must match ``words_needed()`` in ``native/pprop_rs/src/pauli.rs`` exactly -
+    it picks which of the const-generic ``NW`` monomorphizations (dispatched
+    by ``dispatch_nw!`` in ``lib.rs``) handles this circuit, and this function picks how many ``u64`` limbs
     :func:`_int_to_words` chunks each :class:`~pprop.pauli.op.PauliOp` into
     for the trip across that boundary. A mismatch would silently truncate
     high qubit indices.
