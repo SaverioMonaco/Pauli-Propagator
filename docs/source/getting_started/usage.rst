@@ -82,8 +82,10 @@ Step 3: Propagate
 
 ``.propagate()`` evolves each observable backwards through the circuit, via
 the Rust extension ``pprop_rs`` (see :doc:`/native_pprop_rs`). It runs
-silently and returns nothing; the propagated expressions end up in
-``prop.exprs``.
+silently and returns nothing; it compiles each observable into a program that
+``prop(params)`` then evaluates. The readable expressions, ``prop.exprs``, are
+built on request the first time you ask for them, which is only practical for
+small circuits.
 
 .. code-block:: python
 

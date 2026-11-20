@@ -23,21 +23,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
 
-from numpy import arange, array, asarray, cos, integer, ndarray, sin
+import pprop_rs
+from numpy import arange, array, asarray, cos, empty, float64, integer, ndarray, sin
 from pennylane import draw
 from pennylane.tape import QuantumTape
-
-import pprop_rs
 
 from .. import gates
 from ..pauli.sentence import PauliDict
 from .binding import BoundPropagator, Free, affine_from_exprs
-from .evaluator import make_sparse_evaluator
 from .utils import remove_duplicate_observables, requires_propagation
 
 #: Gate class name (pennylane's Operator.name) -> pprop_rs gate-kind code.
 #: Must stay in sync with the kind constants at the top of
-#: native/pprop_rs/src/lib.rs.
+#: native/pprop_rs/src/gates.rs.
 _GATE_KIND = {
     "RX": 0, "RY": 1, "RZ": 2,
     "Hadamard": 3, "S": 4, "SX": 5, "T": 6,
@@ -50,9 +48,9 @@ def _words_needed(num_qubits: int) -> int:
     """
     Smallest power-of-two count of 64-bit words covering ``num_qubits``.
 
-    Must match ``words_needed()`` in ``native/pprop_rs/src/lib.rs`` exactly -
-    it picks which of that file's const-generic ``NW`` monomorphizations
-    handles this circuit, and this function picks how many ``u64`` limbs
+    Must match ``words_needed()`` in ``native/pprop_rs/src/pauli.rs`` exactly -
+    it picks which of the const-generic ``NW`` monomorphizations (dispatched
+    by ``dispatch_nw!`` in ``lib.rs``) handles this circuit, and this function picks how many ``u64`` limbs
     :func:`_int_to_words` chunks each :class:`~pprop.pauli.op.PauliOp` into
     for the trip across that boundary. A mismatch would silently truncate
     high qubit indices.
@@ -155,9 +153,18 @@ class Propagator:
     k2_mode : str
         ``"frequency"`` or ``"sine"``: what ``k2`` counts (see above).
     exprs : list[list[tuple[float, list[int], list[int]]]]
-        Populated by :meth:`propagate`. Each entry is a list of
-        ``(coeff, sin_indices, cos_indices)`` tuples that together encode the
-        symbolic expectation value for the corresponding observable.
+        The symbolic expectation value of each observable: a list of
+        ``(coeff, sin_indices, cos_indices)`` tuples, one per Pauli path.
+        Computed by the sum-of-terms engine the first time it is read after
+        :meth:`propagate` (``None`` before), then kept. Its size grows with the
+        number of paths, so it is meant for small circuits, e.g. for
+        :meth:`expression`.
+    programs : list[pprop_rs.TapeProgram] or None
+        Populated by :meth:`propagate` when it uses the tape engine: one
+        compiled tape per observable.
+    engine : str or None
+        Populated by :meth:`propagate`: ``"tape"``. (The sum-of-terms engine
+        only computes :attr:`exprs`.)
     _eval_list : list[Callable]
         Populated by :meth:`propagate`. Fast numeric evaluators
         ``f(sins, coss) -> float`` for each observable, where ``sins`` and
@@ -256,6 +263,12 @@ class Propagator:
         ]
         self.num_params : int = max(index_params) + 1 if index_params else 0
 
+        # Set by propagate(); exprs is computed lazily from _rust_inputs.
+        self._exprs = None
+        self._rust_inputs = None
+        self.programs = None
+        self.engine : Optional[str] = None
+
         # Guards __call__ and eval_and_grad until propagate() has been run.
         self._propagated : bool = False
 
@@ -273,13 +286,20 @@ class Propagator:
         """
         Propagate each observable backwards through the circuit (Heisenberg picture).
 
-        Evolves every entry of :attr:`paulidicts` through :attr:`gates` in
-        reverse (the Heisenberg picture) inside the Rust extension
-        ``pprop_rs``, accumulating each observable's symbolic
-        trigonometric expectation-value expression into :attr:`exprs`, then
-        compiles each expression into a fast numeric callable
-        (:attr:`_eval_list`/:attr:`_eval_and_grad_list`, via the "sparse"
-        gathered-array representation; see ``evaluator.make_sparse_evaluator``).
+        By default this compiles each observable into a *tape*
+        (:attr:`programs`, see ``native/pprop_rs/src/tape``): every Pauli word
+        the propagation meets gets a box for its coefficient, and each gate
+        becomes a list of boxes to mix. Paths that reach the same word are
+        added in its box, so the size grows with the number of words, not with
+        the number of Pauli paths. :meth:`__call__` and :meth:`eval_and_grad`
+        then run the tape for any parameters.
+
+        ``k1`` and ``k2`` (with either ``k2_mode``) truncate exactly as in the
+        sum-of-terms engine; with ``k2`` every box holds ``k2 + 1`` numbers,
+        one per number of sin/cos factors. ``coeff_threshold`` works
+        differently from the sum-of-terms engine, see below. :attr:`exprs` is
+        computed by the sum-of-terms engine when first read.
+
         Idempotent: calling this again after a successful call is a no-op
         (prints a notice and returns).
 
@@ -299,6 +319,12 @@ class Propagator:
         Results under frequency truncation can differ from earlier revisions.
         With ``k2_mode="sine"`` only sin factors count toward ``k2``.
 
+        In the sum-of-terms engine, if no gate is trainable
+        (``num_params == 0``), every term is a plain number, so the terms each
+        Pauli word collects are summed into one after every layer. The cost
+        then grows with the number of distinct words instead of the number of
+        paths.
+
         Parameters
         ----------
         use_dead_qubit_pruner : bool, optional
@@ -311,10 +337,17 @@ class Propagator:
             exceeds the maximum reduction achievable by the remaining
             circuit. Defaults to ``False``.
         coeff_threshold : float, optional
-            If given, any :data:`~pprop.pauli.sentence.CoeffTerm` whose
-            scalar magnitude falls below this threshold is discarded after
-            every gate step. This is approximate, equivalent to the old
-            ``CoefficientTruncation``. ``None`` (default) disables this.
+            If given, a Pauli word whose coefficient can never reach this
+            threshold, for any parameters, is dropped. The compiler keeps an
+            upper bound on every word's coefficient (over all parameters) and
+            drops the word once the bound falls below the threshold; the sum
+            of the dropped words' bounds is ``programs[i].dropped_bound``, and
+            without ``k1`` and ``k2`` the expectation value is off by at most
+            that, for any parameters. This differs from the sum-of-terms
+            engine, which drops each term whose numeric coefficient is below
+            the threshold: with ``coeff_threshold``, :attr:`exprs` (computed
+            that way) and :meth:`__call__` give different values. ``None``
+            (default) disables this.
         eval_n_jobs : int, optional
             Number of threads used to evaluate observables in parallel on
             every call to :meth:`__call__`/:meth:`eval_and_grad`. Defaults
@@ -323,10 +356,11 @@ class Propagator:
             pay off). Pass ``-1`` to use all available cores (respecting a
             cgroup/SLURM allocation via ``os.sched_getaffinity``).
         n_threads : int, optional
-            Number of threads the propagation itself runs on. Defaults to
-            ``-1``: every CPU this process may use (respecting a cgroup/SLURM
-            allocation, like ``eval_n_jobs``), up to 32. The expression is
-            identical for every thread count.
+            Number of threads the sum-of-terms engine runs on (also when it
+            computes :attr:`exprs`). Defaults to ``-1``: every CPU this process
+            may use (respecting a cgroup/SLURM allocation, like
+            ``eval_n_jobs``), up to 32. The expression is identical for every
+            thread count. The tape compiles and evaluates on one thread.
         """
         if self._propagated:
             print("Already propagated")
@@ -341,6 +375,57 @@ class Propagator:
         elif n_threads < 1:
             raise ValueError(f"n_threads must be -1 or a positive integer, got {n_threads}")
 
+        self._rust_inputs = self._build_rust_inputs()
+        self._terms_settings = dict(
+            use_dead_qubit_pruner=use_dead_qubit_pruner,
+            use_xy_weight_pruner=use_xy_weight_pruner,
+            coeff_threshold=coeff_threshold,
+            n_threads=n_threads,
+        )
+        self._exprs = None
+
+        self.eval_n_jobs = eval_n_jobs
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._eval_list = []
+        self._eval_and_grad_list = []
+
+        self.engine = "tape"
+        gate_arrays, rust_paulidicts = self._rust_inputs
+        self.programs = pprop_rs.compile_tapes(
+            self.num_qubits,
+            *gate_arrays,
+            rust_paulidicts,
+            self.k1 if self.k1 is not None else -1,
+            use_dead_qubit_pruner,
+            use_xy_weight_pruner,
+            self.k2 if self.k2 is not None else -1,
+            self.k2_mode == "sine",
+            coeff_threshold if coeff_threshold is not None else -1.0,
+        )
+        for program in self.programs:
+            fg = _tape_evaluator(program, self.num_params)
+            self._eval_list.append(fg[0])
+            self._eval_and_grad_list.append(fg[1])
+
+        if eval_n_jobs > 1:
+            self._executor = ThreadPoolExecutor(max_workers=eval_n_jobs)
+
+        self._propagated = True
+
+    @property
+    def exprs(self):
+        """The expectation value of each observable as ``(coeff, sin_indices,
+        cos_indices)`` terms, one per Pauli path (see the class docstring).
+        Computed by the sum-of-terms engine the first time it is read after
+        :meth:`propagate`, with the same truncations and pruners, then kept.
+        ``None`` before :meth:`propagate`."""
+        if self._exprs is None and self._rust_inputs is not None:
+            self._exprs = self._propagate_terms()
+        return self._exprs
+
+    def _build_rust_inputs(self):
+        """The gates and observables in the form ``pprop_rs`` takes:
+        ``((gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed), paulidicts)``."""
         gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed = [], [], [], [], []
         for g in self.gates:
             name = g.qml_gate.name
@@ -359,10 +444,10 @@ class Propagator:
                 gate_param.append(int(g.parameter))
                 gate_fixed.append(None)
             else:
-                # Fixed-value gate: hand the constant angle to the kernel, which
-                # folds its sin/cos into the coefficients and drops the branches
-                # that fold to zero. Never int(g.parameter), which would
-                # silently alias the value onto an unrelated trainable index.
+                # Fixed-value gate: hand the constant angle to pprop_rs, which
+                # uses its sin/cos as constants (both engines). Never
+                # int(g.parameter), which would silently alias the value onto
+                # an unrelated trainable index.
                 gate_param.append(-1)
                 gate_fixed.append(float(g.parameter))
 
@@ -383,41 +468,33 @@ class Propagator:
                     spec.append((x_words, z_words, float(c), list(s), list(cc)))
             rust_paulidicts.append(spec)
 
+        gate_arrays = (gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed)
+        return gate_arrays, rust_paulidicts
+
+    def _propagate_terms(self):
+        """Run the sum-of-terms engine with the settings of :meth:`propagate`."""
+        gate_arrays, rust_paulidicts = self._rust_inputs
+        t = self._terms_settings
         # The result holds two Python lists per term. Allocating hundreds of
         # thousands of them would set off the cyclic garbage collector again
         # and again, although lists of ints cannot form a cycle.
         gc_was_enabled = gc.isenabled()
         gc.disable()
         try:
-            self.exprs = pprop_rs.propagate_batch(
+            return pprop_rs.propagate_batch(
                 self.num_qubits,
-                gate_kind, gate_wire0, gate_wire1, gate_param, gate_fixed,
+                *gate_arrays,
                 self.k1 if self.k1 is not None else -1,
                 self.k2 if self.k2 is not None else -1,
-                coeff_threshold if coeff_threshold is not None else -1.0,
-                use_dead_qubit_pruner, use_xy_weight_pruner,
+                t["coeff_threshold"] if t["coeff_threshold"] is not None else -1.0,
+                t["use_dead_qubit_pruner"], t["use_xy_weight_pruner"],
                 rust_paulidicts,
-                n_threads,
+                t["n_threads"],
                 sine_order=self.k2_mode == "sine",
             )
         finally:
             if gc_was_enabled:
                 gc.enable()
-
-        self.eval_n_jobs = eval_n_jobs
-        self._executor: Optional[ThreadPoolExecutor] = None
-
-        self._eval_list = []
-        self._eval_and_grad_list = []
-        for expr in self.exprs:
-            fg = make_sparse_evaluator(expr, self.num_params)
-            self._eval_list.append(fg[0])
-            self._eval_and_grad_list.append(fg[1])
-
-        if eval_n_jobs > 1:
-            self._executor = ThreadPoolExecutor(max_workers=eval_n_jobs)
-
-        self._propagated = True
 
     def show(self) -> None:
         """
@@ -593,3 +670,19 @@ class Propagator:
         vals  = array([v for v, _ in results])   # shape: (num_observables,)
         grads = stack([g for _, g in results])    # shape: (num_observables, num_params)
         return vals, grads
+
+
+def _tape_evaluator(program, num_params: int):
+    """``(eval, eval_grad)`` on a ``pprop_rs.TapeProgram``, with the same
+    ``f(sins, coss)`` interface as the sum-of-terms evaluators."""
+    grad = empty(num_params)
+
+    def _eval(sins, coss) -> float:
+        return program.eval(asarray(sins, dtype=float64), asarray(coss, dtype=float64))
+
+    def _eval_grad(sins, coss):
+        value = program.eval_and_grad(asarray(sins, dtype=float64), asarray(coss, dtype=float64), grad)
+        # The tape writes into one buffer; callers keep the returned gradient.
+        return value, grad.copy()
+
+    return _eval, _eval_grad
